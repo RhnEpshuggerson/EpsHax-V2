@@ -3,6 +3,9 @@
 #include <sstream>
 #include <thread>
 #include <chrono>
+#include <windows.h>
+#include <winhttp.h>
+#pragma comment(lib, "winhttp.lib")
 
 std::mutex g_consoleMutex;
 std::vector<LogEntry> g_consoleLogs;
@@ -263,8 +266,97 @@ int LuaExecutor::lua_EditToggle(lua_State* L) {
 }
 
 int LuaExecutor::lua_SendWebhook(lua_State* L) {
-    const char* webhook = luaL_checkstring(L, 1);
-    debugLog("[SYSTEM] SendWebhook to " + std::string(webhook));
+    const char* webhookUrl = luaL_checkstring(L, 1);
+    const char* payload = luaL_checkstring(L, 2);
+    debugLog("[SYSTEM] SendWebhook to " + std::string(webhookUrl));
+
+    std::thread([webhookUrl, payload]() {
+        std::wstring urlStr(webhookUrl, webhookUrl + strlen(webhookUrl));
+
+        URL_COMPONENTS urlComp = {};
+        urlComp.dwStructSize = sizeof(urlComp);
+        urlComp.lpszHostName = new wchar_t[256];
+        urlComp.dwHostNameLength = 256;
+        urlComp.lpszUrlPath = new wchar_t[1024];
+        urlComp.dwUrlPathLength = 1024;
+        urlComp.lpszExtraInfo = new wchar_t[256];
+        urlComp.dwExtraInfoLength = 256;
+
+        if (!WinHttpCrackUrl(urlStr.c_str(), 0, 0, &urlComp)) {
+            debugLog("[ERROR] WinHttpCrackUrl failed");
+            delete[] urlComp.lpszHostName;
+            delete[] urlComp.lpszUrlPath;
+            delete[] urlComp.lpszExtraInfo;
+            return;
+        }
+
+        std::wstring host(urlComp.lpszHostName, urlComp.dwHostNameLength);
+        std::wstring path(urlComp.lpszUrlPath, urlComp.dwUrlPathLength);
+
+        HINTERNET hSession = WinHttpOpen(L"CoemsExecutor/1.0",
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+            WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) {
+            debugLog("[ERROR] WinHttpOpen failed: " + std::to_string(GetLastError()));
+            delete[] urlComp.lpszHostName;
+            delete[] urlComp.lpszUrlPath;
+            delete[] urlComp.lpszExtraInfo;
+            return;
+        }
+
+        HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(),
+            urlComp.nPort, 0);
+        if (!hConnect) {
+            debugLog("[ERROR] WinHttpConnect failed: " + std::to_string(GetLastError()));
+            WinHttpCloseHandle(hSession);
+            delete[] urlComp.lpszHostName;
+            delete[] urlComp.lpszUrlPath;
+            delete[] urlComp.lpszExtraInfo;
+            return;
+        }
+
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST",
+            path.c_str(), nullptr, WINHTTP_NO_REFERER,
+            WINHTTP_DEFAULT_ACCEPT_TYPES,
+            urlComp.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+        if (!hRequest) {
+            debugLog("[ERROR] WinHttpOpenRequest failed: " + std::to_string(GetLastError()));
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
+            delete[] urlComp.lpszHostName;
+            delete[] urlComp.lpszUrlPath;
+            delete[] urlComp.lpszExtraInfo;
+            return;
+        }
+
+        const wchar_t* headers = L"Content-Type: application/json";
+        BOOL sent = WinHttpSendRequest(hRequest,
+            headers, -1L,
+            (LPVOID)payload, (DWORD)strlen(payload),
+            (DWORD)strlen(payload), 0);
+
+        if (sent) {
+            WinHttpReceiveResponse(hRequest, nullptr);
+            DWORD statusCode = 0;
+            DWORD statusSize = sizeof(statusCode);
+            WinHttpQueryHeaders(hRequest,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX,
+                &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+            debugLog("[WEBHOOK] Response: " + std::to_string((int)statusCode));
+        } else {
+            debugLog("[ERROR] WinHttpSendRequest failed: " + std::to_string(GetLastError()));
+        }
+
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        delete[] urlComp.lpszHostName;
+        delete[] urlComp.lpszUrlPath;
+        delete[] urlComp.lpszExtraInfo;
+    }).detach();
+
     return 0;
 }
 
