@@ -1,0 +1,13 @@
+build/
+out/
+libs/
+.vs/
+*.sln
+*.vcxproj*
+*.user
+*.suo
+*.db
+*.opendb
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
