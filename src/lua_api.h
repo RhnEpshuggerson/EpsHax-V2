@@ -18,6 +18,9 @@ extern std::mutex g_consoleMutex;
 extern std::vector<LogEntry> g_consoleLogs;
 void consoleLog(const std::string& msg);
 
+extern std::mutex g_debugMutex;
+extern std::vector<LogEntry> g_debugLogs;
+
 struct CallbackInfo {
     std::string name;
     std::string type;

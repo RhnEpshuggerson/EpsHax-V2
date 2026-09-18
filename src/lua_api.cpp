@@ -7,6 +7,9 @@
 std::mutex g_consoleMutex;
 std::vector<LogEntry> g_consoleLogs;
 
+std::mutex g_debugMutex;
+std::vector<LogEntry> g_debugLogs;
+
 void consoleLog(const std::string& msg) {
     std::lock_guard<std::mutex> lock(g_consoleMutex);
     g_consoleLogs.push_back({msg, g_currentTime});

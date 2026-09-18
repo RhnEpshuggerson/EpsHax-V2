@@ -51,20 +51,7 @@ if(NOT lua_POPULATED)
     target_include_directories(lua PUBLIC ${lua_SOURCE_DIR}/src)
 endif()
 
-# ── GLFW (for overlay window) ────────────────────────────────────────
-option(GLFW_BUILD_DOCS OFF)
-option(GLFW_BUILD_TESTS OFF)
-option(GLFW_BUILD_EXAMPLES OFF)
-set(GLFW_BUILD_SHARED OFF CACHE BOOL "" FORCE)
-set(GLFW_BUILD_STATIC ON CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    glfw
-    GIT_REPOSITORY https://github.com/glfw/glfw.git
-    GIT_TAG        3.4
-)
-FetchContent_MakeAvailable(glfw)
-
-# ── ImGui ─────────────────────────────────────────────────────────────
+# ── ImGui (no GLFW, using Win32 + OpenGL3 backend) ───────────────────
 set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/libs/imgui)
 if(NOT EXISTS ${IMGUI_DIR}/imgui.h)
     message(FATAL_ERROR
@@ -79,20 +66,20 @@ add_library(imgui STATIC
     ${IMGUI_DIR}/imgui_draw.cpp
     ${IMGUI_DIR}/imgui_tables.cpp
     ${IMGUI_DIR}/imgui_widgets.cpp
-    ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp
+    ${IMGUI_DIR}/backends/imgui_impl_win32.cpp
     ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
 )
 target_include_directories(imgui PUBLIC
     ${IMGUI_DIR}
     ${IMGUI_DIR}/backends
 )
-target_link_libraries(imgui PUBLIC glfw)
 
-# ── DLL build ─────────────────────────────────────────────────────────
+# ── DLL ───────────────────────────────────────────────────────────────
 add_library(coems_executor SHARED
     src/dllmain.cpp
     src/lua_api.cpp
+    src/hook.cpp
 )
 target_include_directories(coems_executor PRIVATE src)
-target_link_libraries(coems_executor PRIVATE imgui lua glfw opengl32 dwmapi)
+target_link_libraries(coems_executor PRIVATE imgui lua opengl32)
 target_compile_definitions(coems_executor PRIVATE COEMS_EXPORTS)
