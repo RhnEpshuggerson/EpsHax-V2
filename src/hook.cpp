@@ -7,10 +7,12 @@
 #include <gl/GL.h>
 
 #include <string>
+#include <map>
 #include <thread>
 #include <mutex>
 #include <vector>
 #include <chrono>
+#include <sstream>
 #include <windows.h>
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
@@ -22,70 +24,8 @@ HWND g_GameHWND = nullptr;
 bool g_MenuOpen = false;
 WNDPROC oWndProc = nullptr;
 
-// ── Keyboard hook ────────────────────────────────────────────────────
+// ── Keyboard hook (F1 only) ──────────────────────────────────────────
 static HHOOK g_KeyHook = nullptr;
-
-static ImGuiKey VkToImGuiKey(int vk) {
-    switch (vk) {
-        case VK_TAB: return ImGuiKey_Tab;
-        case VK_LEFT: return ImGuiKey_LeftArrow;
-        case VK_RIGHT: return ImGuiKey_RightArrow;
-        case VK_UP: return ImGuiKey_UpArrow;
-        case VK_DOWN: return ImGuiKey_DownArrow;
-        case VK_PRIOR: return ImGuiKey_PageUp;
-        case VK_NEXT: return ImGuiKey_PageDown;
-        case VK_HOME: return ImGuiKey_Home;
-        case VK_END: return ImGuiKey_End;
-        case VK_INSERT: return ImGuiKey_Insert;
-        case VK_DELETE: return ImGuiKey_Delete;
-        case VK_BACK: return ImGuiKey_Backspace;
-        case VK_SPACE: return ImGuiKey_Space;
-        case VK_RETURN: return ImGuiKey_Enter;
-        case VK_ESCAPE: return ImGuiKey_Escape;
-        case VK_OEM_7: return ImGuiKey_Apostrophe;
-        case VK_OEM_COMMA: return ImGuiKey_Comma;
-        case VK_OEM_MINUS: return ImGuiKey_Minus;
-        case VK_OEM_PERIOD: return ImGuiKey_Period;
-        case VK_OEM_2: return ImGuiKey_Slash;
-        case VK_OEM_1: return ImGuiKey_Semicolon;
-        case VK_OEM_PLUS: return ImGuiKey_Equal;
-        case VK_OEM_4: return ImGuiKey_LeftBracket;
-        case VK_OEM_5: return ImGuiKey_Backslash;
-        case VK_OEM_6: return ImGuiKey_RightBracket;
-        case VK_OEM_3: return ImGuiKey_GraveAccent;
-        case VK_LSHIFT: return ImGuiKey_LeftShift;
-        case VK_LCONTROL: return ImGuiKey_LeftCtrl;
-        case VK_LMENU: return ImGuiKey_LeftAlt;
-        case VK_RSHIFT: return ImGuiKey_RightShift;
-        case VK_RCONTROL: return ImGuiKey_RightCtrl;
-        case VK_RMENU: return ImGuiKey_RightAlt;
-        case '0': return ImGuiKey_0; case '1': return ImGuiKey_1;
-        case '2': return ImGuiKey_2; case '3': return ImGuiKey_3;
-        case '4': return ImGuiKey_4; case '5': return ImGuiKey_5;
-        case '6': return ImGuiKey_6; case '7': return ImGuiKey_7;
-        case '8': return ImGuiKey_8; case '9': return ImGuiKey_9;
-        case 'A': return ImGuiKey_A; case 'B': return ImGuiKey_B;
-        case 'C': return ImGuiKey_C; case 'D': return ImGuiKey_D;
-        case 'E': return ImGuiKey_E; case 'F': return ImGuiKey_F;
-        case 'G': return ImGuiKey_G; case 'H': return ImGuiKey_H;
-        case 'I': return ImGuiKey_I; case 'J': return ImGuiKey_J;
-        case 'K': return ImGuiKey_K; case 'L': return ImGuiKey_L;
-        case 'M': return ImGuiKey_M; case 'N': return ImGuiKey_N;
-        case 'O': return ImGuiKey_O; case 'P': return ImGuiKey_P;
-        case 'Q': return ImGuiKey_Q; case 'R': return ImGuiKey_R;
-        case 'S': return ImGuiKey_S; case 'T': return ImGuiKey_T;
-        case 'U': return ImGuiKey_U; case 'V': return ImGuiKey_V;
-        case 'W': return ImGuiKey_W; case 'X': return ImGuiKey_X;
-        case 'Y': return ImGuiKey_Y; case 'Z': return ImGuiKey_Z;
-        case VK_F1: return ImGuiKey_F1; case VK_F2: return ImGuiKey_F2;
-        case VK_F3: return ImGuiKey_F3; case VK_F4: return ImGuiKey_F4;
-        case VK_F5: return ImGuiKey_F5; case VK_F6: return ImGuiKey_F6;
-        case VK_F7: return ImGuiKey_F7; case VK_F8: return ImGuiKey_F8;
-        case VK_F9: return ImGuiKey_F9; case VK_F10: return ImGuiKey_F10;
-        case VK_F11: return ImGuiKey_F11; case VK_F12: return ImGuiKey_F12;
-        default: return ImGuiKey_None;
-    }
-}
 
 static LRESULT CALLBACK KeyHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode >= 0) {
@@ -157,6 +97,240 @@ static bool debugInventory = true;
 static bool debugPlayers = true;
 static char scriptBuf[16384] = "";
 static LuaExecutor* g_executor = nullptr;
+
+// ── GameState ────────────────────────────────────────────────────────
+GameState& GameState::instance() {
+    static GameState inst;
+    return inst;
+}
+
+static std::string trim(const std::string& s) {
+    size_t start = s.find_first_not_of(" \t\r\n");
+    size_t end = s.find_last_not_of(" \t\r\n");
+    if (start == std::string::npos) return "";
+    return s.substr(start, end - start + 1);
+}
+
+static std::map<std::string, std::string> parseTextLines(const std::string& text) {
+    std::map<std::string, std::string> kv;
+    std::istringstream stream(text);
+    std::string line;
+    int idx = 0;
+    while (std::getline(stream, line)) {
+        line = trim(line);
+        if (line.empty()) continue;
+        size_t pipe = line.find('|');
+        if (pipe != std::string::npos) {
+            std::string key = trim(line.substr(0, pipe));
+            std::string val = trim(line.substr(pipe + 1));
+            kv[key] = val;
+        } else {
+            kv["_" + std::to_string(idx)] = line;
+        }
+        idx++;
+    }
+    return kv;
+}
+
+static float safeFloat(const std::string& s, float def = 0) {
+    try { return std::stof(s); } catch (...) { return def; }
+}
+
+static int safeInt(const std::string& s, int def = 0) {
+    try { return std::stoi(s); } catch (...) { return def; }
+}
+
+void GameState::parseTextPacket(const std::string& text, bool incoming) {
+    if (text.size() < 4) return;
+
+    auto kv = parseTextLines(text);
+    std::string action = kv["action"];
+
+    if (action == "spawn" || action == "on_spawn") {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (incoming) {
+            PlayerData p;
+            p.name = kv.count("name") ? kv["name"] : "Unknown";
+            p.country = kv.count("country") ? kv["country"] : "us";
+            p.netid = safeInt(kv.count("NetID") ? kv["NetID"] : (kv.count("netID") ? kv["netID"] : "0"));
+            p.userid = safeInt(kv.count("UserID") ? kv["UserID"] : "0");
+            p.pos_x = safeFloat(kv.count("posX") ? kv["posX"] : "0");
+            p.pos_y = safeFloat(kv.count("posY") ? kv["posY"] : "0");
+            p.size_x = safeFloat(kv.count("sizeX") ? kv["sizeX"] : "0");
+            p.size_y = safeFloat(kv.count("sizeY") ? kv["sizeY"] : "0");
+            p.world = kv.count("world") ? kv["world"] : "";
+
+            bool found = false;
+            for (auto& existing : players) {
+                if (existing.netid == p.netid) {
+                    existing = p;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) players.push_back(p);
+        }
+        return;
+    }
+
+    if (action == "on_varlist") {
+        std::lock_guard<std::mutex> lock(mtx);
+        std::string msg = kv.count("msg") ? kv["msg"] : "";
+
+        if (msg == "OnSetBux" || msg.find("SetBux") != std::string::npos) {
+            if (kv.count("1")) localPlayer.gems = safeInt(kv["1"]);
+        }
+
+        PacketEvent ev;
+        ev.type = "OnVarlist";
+        ev.text = text;
+        pushEvent(ev);
+        return;
+    }
+
+    if (action == "set_field_init" || action == "set_field_update") {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (kv.count("type")) {
+            std::string fieldType = kv["type"];
+            if (fieldType == "gems" && kv.count("value")) {
+                localPlayer.gems = safeInt(kv["value"]);
+            }
+            if (fieldType == "world" && kv.count("value")) {
+                localPlayer.world = kv["value"];
+            }
+        }
+        if (kv.count("world_name")) localPlayer.world = kv["world_name"];
+        if (kv.count("width")) world_size_x = safeInt(kv["width"]);
+        if (kv.count("height")) world_size_y = safeInt(kv["height"]);
+        return;
+    }
+
+    if (action == "on_requestWorldSelectMenu" || action == "on_killed" || action == "on_disconnect") {
+        std::lock_guard<std::mutex> lock(mtx);
+        players.clear();
+        localPlayer = PlayerData();
+        return;
+    }
+
+    if (action == "on_chat_message" || action == "on_console_message") {
+        PacketEvent ev;
+        ev.type = "OnVarlist";
+        ev.text = text;
+        pushEvent(ev);
+        return;
+    }
+
+    if (action.find("on_") == 0 || action.find("action|") == 0) {
+        PacketEvent ev;
+        ev.type = incoming ? "OnVarlist" : "OnPacket";
+        ev.text = text;
+        pushEvent(ev);
+        return;
+    }
+
+    if (incoming) {
+        PacketEvent ev;
+        ev.type = "OnVarlist";
+        ev.text = text;
+        pushEvent(ev);
+    }
+}
+
+void GameState::parseIncoming(const char* data, int len) {
+    if (len < 4) return;
+    uint32_t header = *(uint32_t*)data;
+
+    if ((header & 0xFF) == 4 || header == 0 || (header & 0xFFFF) == 0) {
+        std::string text(data + 4, len - 4);
+        if (text.size() > 2) {
+            debugLog("[PACKET IN] " + text.substr(0, 200));
+            parseTextPacket(text, true);
+        }
+        return;
+    }
+
+    int pktType = header & 0xFF;
+    if (len >= (int)sizeof(uint32_t) * 4) {
+        PacketEvent ev;
+        ev.type = "OnRawPacket";
+        ev.packet_type = pktType;
+        if (len >= 24) ev.netid = *(int*)(data + 8);
+        if (len >= 28) ev.item = *(int*)(data + 12);
+        if (len >= 36) { ev.pos_x = *(float*)(data + 16); ev.pos_y = *(float*)(data + 20); }
+        if (len >= 44) { ev.pos2_x = *(float*)(data + 24); ev.pos2_y = *(float*)(data + 28); }
+        if (len >= 32) ev.flags = *(int*)(data + 32);
+
+        if (pktType == 0) {
+            std::lock_guard<std::mutex> lock(mtx);
+            for (auto& p : players) {
+                if (p.netid == ev.netid) {
+                    p.pos_x = ev.pos_x;
+                    p.pos_y = ev.pos_y;
+                    p.flags = ev.flags;
+                    p.tile_x = (int)(ev.pos_x / 32);
+                    p.tile_y = (int)(ev.pos_y / 32);
+                    break;
+                }
+            }
+            if (ev.netid == localPlayer.netid || ev.netid == -1) {
+                localPlayer.pos_x = ev.pos_x;
+                localPlayer.pos_y = ev.pos_y;
+                localPlayer.flags = ev.flags;
+                localPlayer.tile_x = (int)(ev.pos_x / 32);
+                localPlayer.tile_y = (int)(ev.pos_y / 32);
+            }
+        }
+
+        debugLog("[PACKET IN RAW] type=" + std::to_string(pktType) +
+            " netid=" + std::to_string(ev.netid));
+        pushEvent(ev);
+    }
+}
+
+void GameState::parseOutgoing(const char* data, int len) {
+    if (len < 4) return;
+    uint32_t header = *(uint32_t*)data;
+
+    if ((header & 0xFF) == 4 || header == 0 || (header & 0xFFFF) == 0) {
+        std::string text(data + 4, len - 4);
+        if (text.size() > 2) {
+            debugLog("[PACKET OUT] " + text.substr(0, 200));
+            parseTextPacket(text, false);
+        }
+        return;
+    }
+
+    int pktType = header & 0xFF;
+    if (len >= (int)sizeof(uint32_t) * 4) {
+        PacketEvent ev;
+        ev.type = "OnPacket";
+        ev.packet_type = pktType;
+        if (len >= 24) ev.netid = *(int*)(data + 8);
+        if (len >= 28) ev.item = *(int*)(data + 12);
+        if (len >= 36) { ev.pos_x = *(float*)(data + 16); ev.pos_y = *(float*)(data + 20); }
+        if (len >= 44) { ev.pos2_x = *(float*)(data + 24); ev.pos2_y = *(float*)(data + 28); }
+        if (len >= 32) ev.flags = *(int*)(data + 32);
+        debugLog("[PACKET OUT RAW] type=" + std::to_string(pktType));
+        pushEvent(ev);
+    }
+}
+
+void GameState::pushEvent(const PacketEvent& ev) {
+    std::lock_guard<std::mutex> lock(mtx);
+    events.push(ev);
+    if (events.size() > 500) {
+        std::queue<PacketEvent> empty;
+        std::swap(events, empty);
+    }
+}
+
+bool GameState::popEvent(PacketEvent& ev) {
+    std::lock_guard<std::mutex> lock(mtx);
+    if (events.empty()) return false;
+    ev = events.front();
+    events.pop();
+    return true;
+}
 
 // ── wglSwapBuffers hook ──────────────────────────────────────────────
 BOOL WINAPI hk_wglSwapBuffers(HDC hdc) {

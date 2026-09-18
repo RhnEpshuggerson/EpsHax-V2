@@ -1,4 +1,7 @@
 #include "lua_api.h"
+#include "hook.h"
+#include <lua.h>
+#include <lauxlib.h>
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -9,7 +12,6 @@
 
 std::mutex g_consoleMutex;
 std::vector<LogEntry> g_consoleLogs;
-
 std::mutex g_debugMutex;
 std::vector<LogEntry> g_debugLogs;
 
@@ -22,341 +24,299 @@ void consoleLog(const std::string& msg) {
 LuaExecutor::LuaExecutor() {
     L = luaL_newstate();
     luaL_openlibs(L);
+    lua_pushlightuserdata(L, this);
+    lua_setfield(L, LUA_REGISTRYINDEX, "__executor");
     registerAPI();
 }
 
-LuaExecutor::~LuaExecutor() {
-    if (L) lua_close(L);
-}
+LuaExecutor::~LuaExecutor() { if (L) lua_close(L); }
 
 bool LuaExecutor::execute(const std::string& script) {
     if (running) stop();
     running = true;
     startTime = g_currentTime;
-
+    callbacks.clear();
+    timers.clear();
+    threads.clear();
     int err = luaL_loadstring(L, script.c_str()) || lua_pcall(L, 0, 0, 0);
     if (err) {
-        consoleLog("[ERROR] " + std::string(lua_tostring(L, -1)));
-        debugLog("[SYSTEM] Script error: " + std::string(lua_tostring(L, -1)));
+        std::string e = lua_tostring(L, -1);
+        consoleLog("[ERROR] " + e);
         lua_pop(L, 1);
         running = false;
         return false;
     }
-    running = false;
-    consoleLog("[INFO] Script finished.");
-    debugLog("[SYSTEM] Script finished.");
+    consoleLog("[INFO] Script loaded. Running event loop...");
+    float lastFrame = g_currentTime;
+    while (running) {
+        float now = g_currentTime;
+        float dt = now - lastFrame;
+        lastFrame = now;
+        for (auto it = threads.begin(); it != threads.end(); ) {
+            if (now >= it->resumeTime) {
+                int nres;
+                int status = lua_resume(it->co, L, 0, &nres);
+                if (status == LUA_OK) { luaL_unref(L, LUA_REGISTRYINDEX, it->ref); it = threads.erase(it); }
+                else if (status == LUA_YIELD) { ++it; }
+                else { consoleLog("[ERROR] Thread: " + std::string(lua_tostring(it->co, -1))); lua_pop(it->co, 1); luaL_unref(L, LUA_REGISTRYINDEX, it->ref); it = threads.erase(it); }
+            } else { ++it; }
+        }
+        for (auto& cb : callbacks) {
+            if (cb.type == "OnUpdate") {
+                lua_rawgeti(L, LUA_REGISTRYINDEX, cb.ref);
+                lua_pushnumber(L, dt);
+                if (lua_pcall(L, 1, 1, 0) != 0) { consoleLog("[ERROR] OnUpdate: " + std::string(lua_tostring(L, -1))); lua_pop(L, 1); } else { lua_pop(L, 1); }
+            }
+        }
+        PacketEvent ev;
+        while (GameState::instance().popEvent(ev)) {
+            for (auto& cb : callbacks) {
+                if (cb.type == ev.type) {
+                    lua_rawgeti(L, LUA_REGISTRYINDEX, cb.ref);
+                    if (ev.type == "OnVarlist") {
+                        lua_newtable(L);
+                        std::istringstream stream(ev.text);
+                        std::string line;
+                        int idx = 0;
+                        while (std::getline(stream, line)) {
+                            size_t pipe = line.find('|');
+                            std::string key, val;
+                            if (pipe != std::string::npos) { key = line.substr(0, pipe); val = line.substr(pipe + 1); }
+                            else { key = std::to_string(idx); val = line; }
+                            lua_pushstring(L, val.c_str()); lua_setfield(L, -2, key.c_str());
+                            lua_pushstring(L, val.c_str()); lua_rawseti(L, -2, idx);
+                            idx++;
+                        }
+                        lua_pushstring(L, ev.text.c_str());
+                        if (lua_pcall(L, 2, 1, 0) != 0) lua_pop(L, 1); else lua_pop(L, 1);
+                    } else {
+                        lua_newtable(L);
+                        lua_pushinteger(L, ev.packet_type); lua_setfield(L, -2, "type");
+                        lua_pushinteger(L, ev.netid); lua_setfield(L, -2, "netid");
+                        lua_pushinteger(L, ev.flags); lua_setfield(L, -2, "flags");
+                        lua_pushinteger(L, ev.item); lua_setfield(L, -2, "item");
+                        lua_pushnumber(L, ev.pos_x); lua_setfield(L, -2, "pos_x");
+                        lua_pushnumber(L, ev.pos_y); lua_setfield(L, -2, "pos_y");
+                        lua_pushstring(L, ev.text.c_str()); lua_setfield(L, -2, "data");
+                        if (lua_pcall(L, 1, 1, 0) != 0) lua_pop(L, 1); else lua_pop(L, 1);
+                    }
+                }
+            }
+        }
+        for (auto it = timers.begin(); it != timers.end(); ) {
+            if (now - it->lastTick >= it->interval_ms / 1000.0f) {
+                it->lastTick = now;
+                lua_rawgeti(L, LUA_REGISTRYINDEX, it->ref);
+                if (lua_pcall(L, 0, 0, 0) != 0) { consoleLog("[ERROR] Timer: " + std::string(lua_tostring(L, -1))); lua_pop(L, 1); }
+                if (it->repeat > 0) { it->repeat--; if (it->repeat == 0) { luaL_unref(L, LUA_REGISTRYINDEX, it->ref); it = timers.erase(it); continue; } }
+            }
+            ++it;
+        }
+        Sleep(10);
+    }
+    for (auto& cb : callbacks) luaL_unref(L, LUA_REGISTRYINDEX, cb.ref); callbacks.clear();
+    for (auto& t : timers) luaL_unref(L, LUA_REGISTRYINDEX, t.ref); timers.clear();
+    for (auto& t : threads) luaL_unref(L, LUA_REGISTRYINDEX, t.ref); threads.clear();
+    consoleLog("[INFO] Script stopped.");
     return true;
 }
 
 void LuaExecutor::stop() {
     running = false;
     if (L) lua_close(L);
-    L = luaL_newstate();
-    luaL_openlibs(L);
-    registerAPI();
+    L = luaL_newstate(); luaL_openlibs(L);
+    lua_pushlightuserdata(L, this); lua_setfield(L, LUA_REGISTRYINDEX, "__executor");
+    registerAPI(); callbacks.clear(); timers.clear(); threads.clear();
 }
 
-// ── API Implementation ───────────────────────────────────────────────
-
-int LuaExecutor::lua_log(lua_State* L) {
-    const char* msg = luaL_checkstring(L, 1);
-    consoleLog("[LUA] " + std::string(msg));
-    return 0;
-}
-
-int LuaExecutor::lua_SendPacket(lua_State* L) {
-    int type = (int)luaL_checkinteger(L, 1);
-    const char* packet = luaL_checkstring(L, 2);
-    debugLog("[PACKET] SendPacket type=" + std::to_string(type) + " data=" + packet);
-    return 0;
-}
-
-int LuaExecutor::lua_SendPacketRaw(lua_State* L) {
-    debugLog("[PACKET] SendPacketRaw");
-    return 0;
-}
-
-int LuaExecutor::lua_SendVarlist(lua_State* L) {
-    debugLog("[PACKET] SendVarlist");
-    return 0;
-}
+int LuaExecutor::lua_log(lua_State* L) { consoleLog("[LUA] " + std::string(luaL_checkstring(L, 1))); return 0; }
+int LuaExecutor::lua_SendPacket(lua_State* L) { debugLog("[PACKET] SendPacket type=" + std::to_string((int)luaL_checkinteger(L, 1))); return 0; }
+int LuaExecutor::lua_SendPacketRaw(lua_State* L) { return 0; }
+int LuaExecutor::lua_SendVarlist(lua_State* L) { return 0; }
 
 int LuaExecutor::lua_GetLocal(lua_State* L) {
-    debugLog("[PLAYER] GetLocal called");
+    auto& gs = GameState::instance();
+    std::lock_guard<std::mutex> lock(gs.mtx);
+    auto& p = gs.localPlayer;
+    debugLog("[PLAYER] GetLocal: name=" + p.name + " world=" + p.world + " gems=" + std::to_string(p.gems));
     lua_newtable(L);
-    lua_pushstring(L, "Player");
-    lua_setfield(L, -2, "name");
-    lua_pushstring(L, "STUB");
-    lua_setfield(L, -2, "world");
-    lua_pushstring(L, "us");
-    lua_setfield(L, -2, "country");
-    lua_pushinteger(L, 0);
-    lua_setfield(L, -2, "pos_x");
-    lua_pushinteger(L, 0);
-    lua_setfield(L, -2, "pos_y");
-    lua_pushinteger(L, 0);
-    lua_setfield(L, -2, "tile_x");
-    lua_pushinteger(L, 0);
-    lua_setfield(L, -2, "tile_y");
-    lua_pushinteger(L, 20);
-    lua_setfield(L, -2, "size_x");
-    lua_pushinteger(L, 20);
-    lua_setfield(L, -2, "size_y");
-    lua_pushinteger(L, 1);
-    lua_setfield(L, -2, "netid");
-    lua_pushinteger(L, 100);
-    lua_setfield(L, -2, "userid");
-    lua_pushinteger(L, 9999);
-    lua_setfield(L, -2, "gems");
-    lua_pushboolean(L, 0);
-    lua_setfield(L, -2, "facing_left");
-    lua_pushinteger(L, 0);
-    lua_setfield(L, -2, "flags");
-    lua_pushinteger(L, 0);
-    lua_setfield(L, -2, "flags2");
+    lua_pushstring(L, p.name.c_str()); lua_setfield(L, -2, "name");
+    lua_pushstring(L, p.world.c_str()); lua_setfield(L, -2, "world");
+    lua_pushstring(L, p.country.c_str()); lua_setfield(L, -2, "country");
+    lua_pushnumber(L, p.pos_x); lua_setfield(L, -2, "pos_x");
+    lua_pushnumber(L, p.pos_y); lua_setfield(L, -2, "pos_y");
+    lua_pushinteger(L, p.tile_x); lua_setfield(L, -2, "tile_x");
+    lua_pushinteger(L, p.tile_y); lua_setfield(L, -2, "tile_y");
+    lua_pushnumber(L, p.size_x); lua_setfield(L, -2, "size_x");
+    lua_pushnumber(L, p.size_y); lua_setfield(L, -2, "size_y");
+    lua_pushinteger(L, p.netid); lua_setfield(L, -2, "netid");
+    lua_pushinteger(L, p.userid); lua_setfield(L, -2, "userid");
+    lua_pushinteger(L, p.gems); lua_setfield(L, -2, "gems");
+    lua_pushboolean(L, p.facing_left); lua_setfield(L, -2, "facing_left");
+    lua_pushinteger(L, p.flags); lua_setfield(L, -2, "flags");
+    lua_pushinteger(L, p.flags2); lua_setfield(L, -2, "flags2");
     return 1;
 }
 
-int LuaExecutor::lua_GetInventory(lua_State* L) {
-    debugLog("[INV] GetInventory called");
-    lua_newtable(L);
-    return 1;
-}
+int LuaExecutor::lua_GetInventory(lua_State* L) { lua_newtable(L); return 1; }
 
 int LuaExecutor::lua_GetPlayers(lua_State* L) {
-    debugLog("[PLAYER] GetPlayers called");
+    auto& gs = GameState::instance();
+    std::lock_guard<std::mutex> lock(gs.mtx);
     lua_newtable(L);
+    int idx = 1;
+    for (auto& p : gs.players) {
+        lua_newtable(L);
+        lua_pushstring(L, p.name.c_str()); lua_setfield(L, -2, "name");
+        lua_pushstring(L, p.world.c_str()); lua_setfield(L, -2, "world");
+        lua_pushstring(L, p.country.c_str()); lua_setfield(L, -2, "country");
+        lua_pushnumber(L, p.pos_x); lua_setfield(L, -2, "pos_x");
+        lua_pushnumber(L, p.pos_y); lua_setfield(L, -2, "pos_y");
+        lua_pushinteger(L, p.tile_x); lua_setfield(L, -2, "tile_x");
+        lua_pushinteger(L, p.tile_y); lua_setfield(L, -2, "tile_y");
+        lua_pushinteger(L, p.netid); lua_setfield(L, -2, "netid");
+        lua_pushinteger(L, p.userid); lua_setfield(L, -2, "userid");
+        lua_pushinteger(L, p.gems); lua_setfield(L, -2, "gems");
+        lua_rawseti(L, -2, idx++);
+    }
     return 1;
 }
 
-int LuaExecutor::lua_GetObjects(lua_State* L) {
-    debugLog("[INV] GetObjects called");
-    lua_newtable(L);
-    return 1;
-}
+int LuaExecutor::lua_GetObjects(lua_State* L) { lua_newtable(L); return 1; }
 
 int LuaExecutor::lua_GetTile(lua_State* L) {
     int x = (int)luaL_checkinteger(L, 1);
     int y = (int)luaL_checkinteger(L, 2);
-    debugLog("[PATH] GetTile(" + std::to_string(x) + ", " + std::to_string(y) + ")");
     lua_newtable(L);
-    lua_pushinteger(L, 0);
-    lua_setfield(L, -2, "fg");
-    lua_pushinteger(L, 0);
-    lua_setfield(L, -2, "bg");
-    lua_pushinteger(L, x);
-    lua_setfield(L, -2, "pos_x");
-    lua_pushinteger(L, y);
-    lua_setfield(L, -2, "pos_y");
-    lua_pushinteger(L, 0);
-    lua_setfield(L, -2, "flags");
-    lua_pushboolean(L, 0);
-    lua_setfield(L, -2, "water");
-    lua_pushboolean(L, 0);
-    lua_setfield(L, -2, "fire");
-    lua_pushboolean(L, 0);
-    lua_setfield(L, -2, "ready");
+    lua_pushinteger(L, 0); lua_setfield(L, -2, "fg");
+    lua_pushinteger(L, 0); lua_setfield(L, -2, "bg");
+    lua_pushinteger(L, x); lua_setfield(L, -2, "pos_x");
+    lua_pushinteger(L, y); lua_setfield(L, -2, "pos_y");
+    lua_pushinteger(L, 0); lua_setfield(L, -2, "flags");
+    lua_pushboolean(L, 0); lua_setfield(L, -2, "water");
+    lua_pushboolean(L, 0); lua_setfield(L, -2, "fire");
+    lua_pushboolean(L, 0); lua_setfield(L, -2, "ready");
     return 1;
 }
 
-int LuaExecutor::lua_GetTiles(lua_State* L) {
-    debugLog("[PATH] GetTiles called");
-    lua_newtable(L);
-    return 1;
-}
-
-int LuaExecutor::lua_FindPath(lua_State* L) {
-    int x = (int)luaL_checkinteger(L, 1);
-    int y = (int)luaL_checkinteger(L, 2);
-    debugLog("[PATH] FindPath -> (" + std::to_string(x) + ", " + std::to_string(y) + ")");
-    return 0;
-}
-
-int LuaExecutor::lua_PathFind(lua_State* L) {
-    int x = (int)luaL_checkinteger(L, 1);
-    int y = (int)luaL_checkinteger(L, 2);
-    debugLog("[PATH] PathFind -> (" + std::to_string(x) + ", " + std::to_string(y) + ")");
-    lua_newtable(L);
-    return 1;
-}
-
-int LuaExecutor::lua_CheckPath(lua_State* L) {
-    int x = (int)luaL_checkinteger(L, 1);
-    int y = (int)luaL_checkinteger(L, 2);
-    debugLog("[PATH] CheckPath(" + std::to_string(x) + ", " + std::to_string(y) + ") -> true");
-    lua_pushboolean(L, 1);
-    return 1;
-}
-
-int LuaExecutor::lua_IsSolid(lua_State* L) {
-    int x = (int)luaL_checkinteger(L, 1);
-    int y = (int)luaL_checkinteger(L, 2);
-    debugLog("[PATH] IsSolid(" + std::to_string(x) + ", " + std::to_string(y) + ") -> false");
-    lua_pushboolean(L, 0);
-    return 1;
-}
+int LuaExecutor::lua_GetTiles(lua_State* L) { lua_newtable(L); return 1; }
+int LuaExecutor::lua_FindPath(lua_State* L) { return 0; }
+int LuaExecutor::lua_PathFind(lua_State* L) { lua_newtable(L); return 1; }
+int LuaExecutor::lua_CheckPath(lua_State* L) { lua_pushboolean(L, 1); return 1; }
+int LuaExecutor::lua_IsSolid(lua_State* L) { lua_pushboolean(L, 0); return 1; }
 
 int LuaExecutor::lua_RunThread(lua_State* L) {
     luaL_checktype(L, 1, LUA_TFUNCTION);
-    debugLog("[SYSTEM] RunThread");
+    LuaExecutor* self = nullptr;
+    lua_getfield(L, LUA_REGISTRYINDEX, "__executor");
+    if (lua_type(L, -1) == LUA_TLIGHTUSERDATA) self = (LuaExecutor*)lua_touserdata(L, -1);
+    lua_pop(L, 1);
+    lua_State* co = lua_newthread(L);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
     lua_pushvalue(L, 1);
-    lua_pcall(L, 0, 0, 0);
+    lua_xmove(L, co, 1);
+    if (self) self->threads.push_back({co, 0.0f, ref});
+    int nres;
+    int status = lua_resume(co, L, 0, &nres);
+    if (status == LUA_OK) {
+        if (self) { for (auto it = self->threads.begin(); it != self->threads.end(); ++it) if (it->co == co) { self->threads.erase(it); break; } }
+        luaL_unref(L, LUA_REGISTRYINDEX, ref);
+    } else if (status != LUA_YIELD) {
+        consoleLog("[ERROR] Thread: " + std::string(lua_tostring(co, -1)));
+        lua_pop(co, 1);
+        if (self) { for (auto it = self->threads.begin(); it != self->threads.end(); ++it) if (it->co == co) { self->threads.erase(it); break; } }
+        luaL_unref(L, LUA_REGISTRYINDEX, ref);
+    }
     return 0;
 }
 
 int LuaExecutor::lua_Sleep(lua_State* L) {
     int ms = (int)luaL_checkinteger(L, 1);
-    debugLog("[TIMER] Sleep(" + std::to_string(ms) + "ms)");
-    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-    return 0;
+    LuaExecutor* self = nullptr;
+    lua_getfield(L, LUA_REGISTRYINDEX, "__executor");
+    if (lua_type(L, -1) == LUA_TLIGHTUSERDATA) self = (LuaExecutor*)lua_touserdata(L, -1);
+    lua_pop(L, 1);
+    if (self) {
+        float resumeTime = g_currentTime + ms / 1000.0f;
+        for (auto& t : self->threads) if (t.co == L) { t.resumeTime = resumeTime; break; }
+    }
+    return lua_yield(L, 0);
 }
 
-int LuaExecutor::lua_GetPing(lua_State* L) {
-    lua_pushinteger(L, 42);
-    return 1;
-}
-
-int LuaExecutor::lua_GetItemCount(lua_State* L) {
-    int id = (int)luaL_checkinteger(L, 1);
-    debugLog("[INV] GetItemCount(" + std::to_string(id) + ") -> 0");
-    lua_pushinteger(L, 0);
-    return 1;
-}
+int LuaExecutor::lua_GetPing(lua_State* L) { lua_pushinteger(L, 42); return 1; }
+int LuaExecutor::lua_GetItemCount(lua_State* L) { lua_pushinteger(L, 0); return 1; }
 
 int LuaExecutor::lua_GetItemInfo(lua_State* L) {
-    int id = (int)luaL_checkinteger(L, 1);
-    debugLog("[INV] GetItemInfo(" + std::to_string(id) + ")");
     lua_newtable(L);
-    lua_pushstring(L, "Unknown");
-    lua_setfield(L, -2, "name");
-    lua_pushinteger(L, 0);
-    lua_setfield(L, -2, "item_type");
-    lua_pushinteger(L, 0);
-    lua_setfield(L, -2, "growth");
-    lua_pushinteger(L, 0);
-    lua_setfield(L, -2, "rarity");
-    lua_pushinteger(L, 0);
-    lua_setfield(L, -2, "size");
+    lua_pushstring(L, "Unknown"); lua_setfield(L, -2, "name");
+    lua_pushinteger(L, 0); lua_setfield(L, -2, "item_type");
+    lua_pushinteger(L, 0); lua_setfield(L, -2, "growth");
+    lua_pushinteger(L, 0); lua_setfield(L, -2, "rarity");
+    lua_pushinteger(L, 0); lua_setfield(L, -2, "size");
     return 1;
 }
 
-int LuaExecutor::lua_MessageBox(lua_State* L) {
-    const char* title = luaL_checkstring(L, 1);
-    const char* content = luaL_checkstring(L, 2);
-    debugLog("[SYSTEM] MessageBox: " + std::string(title) + " - " + std::string(content));
-    return 0;
-}
+int LuaExecutor::lua_MessageBox(lua_State* L) { return 0; }
 
 int LuaExecutor::lua_RemoveCallbacks(lua_State* L) {
-    debugLog("[CALLBACK] RemoveCallbacks");
+    LuaExecutor* self = nullptr;
+    lua_getfield(L, LUA_REGISTRYINDEX, "__executor");
+    if (lua_type(L, -1) == LUA_TLIGHTUSERDATA) self = (LuaExecutor*)lua_touserdata(L, -1);
+    lua_pop(L, 1);
+    if (!self) return 0;
+    for (auto& cb : self->callbacks) luaL_unref(L, LUA_REGISTRYINDEX, cb.ref);
+    self->callbacks.clear();
     return 0;
 }
 
 int LuaExecutor::lua_RemoveCallback(lua_State* L) {
     const char* name = luaL_checkstring(L, 1);
-    debugLog("[CALLBACK] RemoveCallback: " + std::string(name));
+    LuaExecutor* self = nullptr;
+    lua_getfield(L, LUA_REGISTRYINDEX, "__executor");
+    if (lua_type(L, -1) == LUA_TLIGHTUSERDATA) self = (LuaExecutor*)lua_touserdata(L, -1);
+    lua_pop(L, 1);
+    if (!self) return 0;
+    for (auto it = self->callbacks.begin(); it != self->callbacks.end(); ) {
+        if (it->name == name) { luaL_unref(L, LUA_REGISTRYINDEX, it->ref); it = self->callbacks.erase(it); } else { ++it; }
+    }
     return 0;
 }
 
-int LuaExecutor::lua_EditToggle(lua_State* L) {
-    const char* module = luaL_checkstring(L, 1);
-    bool toggle = lua_toboolean(L, 2);
-    debugLog("[SYSTEM] EditToggle: " + std::string(module) + " = " + (toggle ? "ON" : "OFF"));
-    return 0;
-}
+int LuaExecutor::lua_EditToggle(lua_State* L) { return 0; }
 
 int LuaExecutor::lua_SendWebhook(lua_State* L) {
     const char* webhookUrl = luaL_checkstring(L, 1);
     const char* payload = luaL_checkstring(L, 2);
-    debugLog("[SYSTEM] SendWebhook to " + std::string(webhookUrl));
-
-    std::thread([webhookUrl, payload]() {
-        std::wstring urlStr(webhookUrl, webhookUrl + strlen(webhookUrl));
-
+    std::string urlStr(webhookUrl);
+    std::string payStr(payload);
+    std::thread([urlStr, payStr]() {
+        std::wstring wUrl(urlStr.begin(), urlStr.end());
         URL_COMPONENTS urlComp = {};
         urlComp.dwStructSize = sizeof(urlComp);
-        urlComp.lpszHostName = new wchar_t[256];
-        urlComp.dwHostNameLength = 256;
-        urlComp.lpszUrlPath = new wchar_t[1024];
-        urlComp.dwUrlPathLength = 1024;
-        urlComp.lpszExtraInfo = new wchar_t[256];
-        urlComp.dwExtraInfoLength = 256;
-
-        if (!WinHttpCrackUrl(urlStr.c_str(), 0, 0, &urlComp)) {
-            debugLog("[ERROR] WinHttpCrackUrl failed");
-            delete[] urlComp.lpszHostName;
-            delete[] urlComp.lpszUrlPath;
-            delete[] urlComp.lpszExtraInfo;
-            return;
+        urlComp.lpszHostName = new wchar_t[256]; urlComp.dwHostNameLength = 256;
+        urlComp.lpszUrlPath = new wchar_t[1024]; urlComp.dwUrlPathLength = 1024;
+        urlComp.lpszExtraInfo = new wchar_t[256]; urlComp.dwExtraInfoLength = 256;
+        if (!WinHttpCrackUrl(wUrl.c_str(), 0, 0, &urlComp)) {
+            delete[] urlComp.lpszHostName; delete[] urlComp.lpszUrlPath; delete[] urlComp.lpszExtraInfo; return;
         }
-
         std::wstring host(urlComp.lpszHostName, urlComp.dwHostNameLength);
         std::wstring path(urlComp.lpszUrlPath, urlComp.dwUrlPathLength);
-
-        HINTERNET hSession = WinHttpOpen(L"CoemsExecutor/1.0",
-            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
-            WINHTTP_NO_PROXY_NAME,
-            WINHTTP_NO_PROXY_BYPASS, 0);
-        if (!hSession) {
-            debugLog("[ERROR] WinHttpOpen failed: " + std::to_string(GetLastError()));
-            delete[] urlComp.lpszHostName;
-            delete[] urlComp.lpszUrlPath;
-            delete[] urlComp.lpszExtraInfo;
-            return;
-        }
-
-        HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(),
-            urlComp.nPort, 0);
-        if (!hConnect) {
-            debugLog("[ERROR] WinHttpConnect failed: " + std::to_string(GetLastError()));
-            WinHttpCloseHandle(hSession);
-            delete[] urlComp.lpszHostName;
-            delete[] urlComp.lpszUrlPath;
-            delete[] urlComp.lpszExtraInfo;
-            return;
-        }
-
-        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST",
-            path.c_str(), nullptr, WINHTTP_NO_REFERER,
-            WINHTTP_DEFAULT_ACCEPT_TYPES,
-            urlComp.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
-        if (!hRequest) {
-            debugLog("[ERROR] WinHttpOpenRequest failed: " + std::to_string(GetLastError()));
-            WinHttpCloseHandle(hConnect);
-            WinHttpCloseHandle(hSession);
-            delete[] urlComp.lpszHostName;
-            delete[] urlComp.lpszUrlPath;
-            delete[] urlComp.lpszExtraInfo;
-            return;
-        }
-
-        const wchar_t* headers = L"Content-Type: application/json";
-        BOOL sent = WinHttpSendRequest(hRequest,
-            headers, -1L,
-            (LPVOID)payload, (DWORD)strlen(payload),
-            (DWORD)strlen(payload), 0);
-
+        HINTERNET hSession = WinHttpOpen(L"CoemsExecutor/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) { delete[] urlComp.lpszHostName; delete[] urlComp.lpszUrlPath; delete[] urlComp.lpszExtraInfo; return; }
+        HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), urlComp.nPort, 0);
+        if (!hConnect) { WinHttpCloseHandle(hSession); delete[] urlComp.lpszHostName; delete[] urlComp.lpszUrlPath; delete[] urlComp.lpszExtraInfo; return; }
+        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", path.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, urlComp.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+        if (!hRequest) { WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession); delete[] urlComp.lpszHostName; delete[] urlComp.lpszUrlPath; delete[] urlComp.lpszExtraInfo; return; }
+        BOOL sent = WinHttpSendRequest(hRequest, L"Content-Type: application/json", -1L, (LPVOID)payStr.c_str(), (DWORD)payStr.size(), (DWORD)payStr.size(), 0);
         if (sent) {
             WinHttpReceiveResponse(hRequest, nullptr);
-            DWORD statusCode = 0;
-            DWORD statusSize = sizeof(statusCode);
-            WinHttpQueryHeaders(hRequest,
-                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                WINHTTP_HEADER_NAME_BY_INDEX,
-                &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
+            DWORD statusCode = 0, statusSize = sizeof(statusCode);
+            WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &statusCode, &statusSize, WINHTTP_NO_HEADER_INDEX);
             debugLog("[WEBHOOK] Response: " + std::to_string((int)statusCode));
-        } else {
-            debugLog("[ERROR] WinHttpSendRequest failed: " + std::to_string(GetLastError()));
         }
-
-        WinHttpCloseHandle(hRequest);
-        WinHttpCloseHandle(hConnect);
-        WinHttpCloseHandle(hSession);
-        delete[] urlComp.lpszHostName;
-        delete[] urlComp.lpszUrlPath;
-        delete[] urlComp.lpszExtraInfo;
+        WinHttpCloseHandle(hRequest); WinHttpCloseHandle(hConnect); WinHttpCloseHandle(hSession);
+        delete[] urlComp.lpszHostName; delete[] urlComp.lpszUrlPath; delete[] urlComp.lpszExtraInfo;
     }).detach();
-
     return 0;
 }
 
@@ -365,29 +325,48 @@ int LuaExecutor::lua_timer_Create(lua_State* L) {
     int interval = (int)luaL_checkinteger(L, 2);
     int repeat_count = (int)luaL_checkinteger(L, 3);
     luaL_checktype(L, 4, LUA_TFUNCTION);
-    debugLog("[TIMER] Create: " + std::string(name) + " interval=" + std::to_string(interval) + "ms repeat=" + std::to_string(repeat_count));
+    LuaExecutor* self = nullptr;
+    lua_getfield(L, LUA_REGISTRYINDEX, "__executor");
+    if (lua_type(L, -1) == LUA_TLIGHTUSERDATA) self = (LuaExecutor*)lua_touserdata(L, -1);
+    lua_pop(L, 1);
+    if (!self) return 0;
+    lua_pushvalue(L, 4);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    self->timers.push_back({name, interval, repeat_count, ref, g_currentTime});
+    debugLog("[TIMER] Create: " + std::string(name));
     return 0;
 }
 
 int LuaExecutor::lua_timer_Destroy(lua_State* L) {
     const char* name = luaL_checkstring(L, 1);
-    debugLog("[TIMER] Destroy: " + std::string(name));
+    LuaExecutor* self = nullptr;
+    lua_getfield(L, LUA_REGISTRYINDEX, "__executor");
+    if (lua_type(L, -1) == LUA_TLIGHTUSERDATA) self = (LuaExecutor*)lua_touserdata(L, -1);
+    lua_pop(L, 1);
+    if (!self) return 0;
+    for (auto it = self->timers.begin(); it != self->timers.end(); ) {
+        if (it->name == name) { luaL_unref(L, LUA_REGISTRYINDEX, it->ref); it = self->timers.erase(it); } else { ++it; }
+    }
     return 0;
 }
 
-int LuaExecutor::lua_timer_Update(lua_State* L) {
-    return 0;
-}
+int LuaExecutor::lua_timer_Update(lua_State* L) { return 0; }
 
 int LuaExecutor::lua_AddCallback(lua_State* L) {
     const char* name = luaL_checkstring(L, 1);
     const char* type = luaL_checkstring(L, 2);
     luaL_checktype(L, 3, LUA_TFUNCTION);
+    LuaExecutor* self = nullptr;
+    lua_getfield(L, LUA_REGISTRYINDEX, "__executor");
+    if (lua_type(L, -1) == LUA_TLIGHTUSERDATA) self = (LuaExecutor*)lua_touserdata(L, -1);
+    lua_pop(L, 1);
+    if (!self) return 0;
+    lua_pushvalue(L, 3);
+    int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    self->callbacks.push_back({name, type, ref});
     debugLog("[CALLBACK] AddCallback: " + std::string(name) + " type=" + std::string(type));
     return 0;
 }
-
-// ── Register all API functions ────────────────────────────────────────
 
 void LuaExecutor::registerAPI() {
     lua_register(L, "SendPacket", lua_SendPacket);
@@ -416,8 +395,6 @@ void LuaExecutor::registerAPI() {
     lua_register(L, "EditToggle", lua_EditToggle);
     lua_register(L, "SendWebhook", lua_SendWebhook);
     lua_register(L, "AddCallback", lua_AddCallback);
-
-    // Register timer sub-table
     lua_newtable(L);
     lua_pushcfunction(L, lua_timer_Create);
     lua_setfield(L, -2, "Create");

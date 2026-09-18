@@ -4,6 +4,8 @@
 #include <vector>
 #include <functional>
 #include <mutex>
+#include <thread>
+#include <atomic>
 
 extern bool g_debugMode;
 extern float g_currentTime;
@@ -27,6 +29,20 @@ struct CallbackInfo {
     int ref;
 };
 
+struct TimerInfo {
+    std::string name;
+    int interval_ms;
+    int repeat;
+    int ref;
+    float lastTick;
+};
+
+struct LuaThreadInfo {
+    lua_State* co;
+    float resumeTime;
+    int ref;
+};
+
 class LuaExecutor {
 public:
     LuaExecutor();
@@ -38,10 +54,14 @@ public:
 
     void registerAPI();
 
+    lua_State* getLuaState() { return L; }
+
 private:
     lua_State* L = nullptr;
-    bool running = false;
+    std::atomic<bool> running{false};
     std::vector<CallbackInfo> callbacks;
+    std::vector<TimerInfo> timers;
+    std::vector<LuaThreadInfo> threads;
     float startTime = 0;
 
     static int lua_SendPacket(lua_State* L);
