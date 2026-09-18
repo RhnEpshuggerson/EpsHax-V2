@@ -14,19 +14,181 @@
 #include <thread>
 #include <mutex>
 #include <windows.h>
-#include <WinUser.h>
 
 float g_currentTime = 0;
 bool g_debugMode = false;
 std::mutex g_debugMutex;
 std::vector<LogEntry> g_debugLogs;
 bool g_menuOpen = true;
+GLFWwindow* g_window = nullptr;
 
 void debugLog(const std::string& msg) {
     std::lock_guard<std::mutex> lock(g_debugMutex);
     g_debugLogs.push_back({msg, g_currentTime});
     if (g_debugLogs.size() > 1000) g_debugLogs.erase(g_debugLogs.begin());
 }
+
+// ── Keyboard hook for input when overlay doesn't have focus ──────────
+static ImGuiKey VkToImGuiKey(int vk) {
+    switch (vk) {
+        case VK_TAB: return ImGuiKey_Tab;
+        case VK_LEFT: return ImGuiKey_LeftArrow;
+        case VK_RIGHT: return ImGuiKey_RightArrow;
+        case VK_UP: return ImGuiKey_UpArrow;
+        case VK_DOWN: return ImGuiKey_DownArrow;
+        case VK_PRIOR: return ImGuiKey_PageUp;
+        case VK_NEXT: return ImGuiKey_PageDown;
+        case VK_HOME: return ImGuiKey_Home;
+        case VK_END: return ImGuiKey_End;
+        case VK_INSERT: return ImGuiKey_Insert;
+        case VK_DELETE: return ImGuiKey_Delete;
+        case VK_BACK: return ImGuiKey_Backspace;
+        case VK_SPACE: return ImGuiKey_Space;
+        case VK_RETURN: return ImGuiKey_Enter;
+        case VK_ESCAPE: return ImGuiKey_Escape;
+        case VK_OEM_7: return ImGuiKey_Apostrophe;
+        case VK_OEM_COMMA: return ImGuiKey_Comma;
+        case VK_OEM_MINUS: return ImGuiKey_Minus;
+        case VK_OEM_PERIOD: return ImGuiKey_Period;
+        case VK_OEM_2: return ImGuiKey_Slash;
+        case VK_OEM_1: return ImGuiKey_Semicolon;
+        case VK_OEM_PLUS: return ImGuiKey_Equal;
+        case VK_OEM_4: return ImGuiKey_LeftBracket;
+        case VK_OEM_5: return ImGuiKey_Backslash;
+        case VK_OEM_6: return ImGuiKey_RightBracket;
+        case VK_OEM_3: return ImGuiKey_GraveAccent;
+        case VK_LSHIFT: return ImGuiKey_LeftShift;
+        case VK_LCONTROL: return ImGuiKey_LeftCtrl;
+        case VK_LMENU: return ImGuiKey_LeftAlt;
+        case VK_RSHIFT: return ImGuiKey_RightShift;
+        case VK_RCONTROL: return ImGuiKey_RightCtrl;
+        case VK_RMENU: return ImGuiKey_RightAlt;
+        case '0': return ImGuiKey_0;
+        case '1': return ImGuiKey_1;
+        case '2': return ImGuiKey_2;
+        case '3': return ImGuiKey_3;
+        case '4': return ImGuiKey_4;
+        case '5': return ImGuiKey_5;
+        case '6': return ImGuiKey_6;
+        case '7': return ImGuiKey_7;
+        case '8': return ImGuiKey_8;
+        case '9': return ImGuiKey_9;
+        case 'A': return ImGuiKey_A;
+        case 'B': return ImGuiKey_B;
+        case 'C': return ImGuiKey_C;
+        case 'D': return ImGuiKey_D;
+        case 'E': return ImGuiKey_E;
+        case 'F': return ImGuiKey_F;
+        case 'G': return ImGuiKey_G;
+        case 'H': return ImGuiKey_H;
+        case 'I': return ImGuiKey_I;
+        case 'J': return ImGuiKey_J;
+        case 'K': return ImGuiKey_K;
+        case 'L': return ImGuiKey_L;
+        case 'M': return ImGuiKey_M;
+        case 'N': return ImGuiKey_N;
+        case 'O': return ImGuiKey_O;
+        case 'P': return ImGuiKey_P;
+        case 'Q': return ImGuiKey_Q;
+        case 'R': return ImGuiKey_R;
+        case 'S': return ImGuiKey_S;
+        case 'T': return ImGuiKey_T;
+        case 'U': return ImGuiKey_U;
+        case 'V': return ImGuiKey_V;
+        case 'W': return ImGuiKey_W;
+        case 'X': return ImGuiKey_X;
+        case 'Y': return ImGuiKey_Y;
+        case 'Z': return ImGuiKey_Z;
+        case VK_F1: return ImGuiKey_F1;
+        case VK_F2: return ImGuiKey_F2;
+        case VK_F3: return ImGuiKey_F3;
+        case VK_F4: return ImGuiKey_F4;
+        case VK_F5: return ImGuiKey_F5;
+        case VK_F6: return ImGuiKey_F6;
+        case VK_F7: return ImGuiKey_F7;
+        case VK_F8: return ImGuiKey_F8;
+        case VK_F9: return ImGuiKey_F9;
+        case VK_F10: return ImGuiKey_F10;
+        case VK_F11: return ImGuiKey_F11;
+        case VK_F12: return ImGuiKey_F12;
+        default: return ImGuiKey_None;
+    }
+}
+
+static LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode >= 0 && g_menuOpen && g_window) {
+        KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lParam;
+        ImGuiIO& io = ImGui::GetIO();
+
+        bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+        bool isUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+
+        if (isDown || isUp) {
+            int vk = kb->vkCode;
+            ImGuiKey imguiKey = VkToImGuiKey(vk);
+            if (imguiKey != ImGuiKey_None) {
+                io.AddKeyEvent(imguiKey, isDown);
+            }
+
+            // Handle ctrl+a, ctrl+c, ctrl+v, ctrl+x
+            if (io.KeyCtrl && isDown) {
+                if (vk == 'A') { io.AddInputCharacterUTF16(1); } // select all handled by imgui
+                if (vk == 'C') { /* copy handled by clipboard */ }
+                if (vk == 'V') {
+                    // paste from clipboard
+                    if (OpenClipboard(nullptr)) {
+                        HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+                        if (hData) {
+                            wchar_t* text = (wchar_t*)GlobalLock(hData);
+                            if (text) {
+                                for (int i = 0; text[i] != 0; i++) {
+                                    if (text[i] <= 127) {
+                                        io.AddInputCharacter((unsigned char)text[i]);
+                                    }
+                                }
+                                GlobalUnlock(hData);
+                            }
+                        }
+                        CloseClipboard();
+                    }
+                }
+                if (vk == 'X') { /* cut handled by imgui */ }
+            }
+
+            // Handle regular character input
+            if (isDown && !io.KeyCtrl && !io.KeyAlt && !io.KeySuper) {
+                if (vk >= 0x20 && vk <= 0x7E && vk != VK_CONTROL && vk != VK_MENU && vk != VK_SHIFT) {
+                    char c = (char)vk;
+                    if (vk >= 'A' && vk <= 'Z' && !GetAsyncKeyState(VK_SHIFT)) {
+                        c = c + 32; // to lowercase
+                    }
+                    if (io.KeyShift) {
+                        // Simple shift mapping for common keys
+                        const char* shifted = "~!@#$%^&*()_+{}|:\"<>?asdfghjklqwertyuiopzxcvbnm";
+                        const char* normal = "`1234567890-=[]\\;',./asdfghjklqwertyuiopzxcvbnm";
+                        for (int i = 0; normal[i]; i++) {
+                            if (c == normal[i]) { c = shifted[i]; break; }
+                        }
+                    }
+                    io.AddInputCharacter((unsigned char)c);
+                }
+            }
+
+            // Always let F1 through
+            if (vk == VK_F1) {
+                return CallNextHookEx(nullptr, nCode, wParam, lParam);
+            }
+
+            // Block keyboard input from reaching growtopia when menu is open
+            if (g_menuOpen && isDown) {
+                return 1;
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+static HHOOK g_keyboardHook = nullptr;
 
 // ── Clipboard callbacks ──────────────────────────────────────────────
 static const char* ClipboardGetText(void*) {
@@ -70,9 +232,9 @@ void OverlayThread(HMODULE hModule) {
         growtopia = FindGrowtopia();
         Sleep(500);
     }
-    Sleep(1000); // Let growtopia fully load
+    Sleep(1500);
 
-    // Init GLFW for overlay
+    // Init GLFW
     if (!glfwInit()) {
         FreeLibraryAndExitThread(hModule, 1);
         return;
@@ -85,7 +247,6 @@ void OverlayThread(HMODULE hModule) {
     glfwWindowHint(GLFW_MOUSE_PASSTHROUGH, GLFW_FALSE);
     glfwWindowHint(GLFW_FOCUS_ON_SHOW, GLFW_FALSE);
 
-    // Get growtopia position and size
     RECT rect;
     GetWindowRect(growtopia, &rect);
     int w = rect.right - rect.left;
@@ -97,6 +258,7 @@ void OverlayThread(HMODULE hModule) {
         FreeLibraryAndExitThread(hModule, 1);
         return;
     }
+    g_window = window;
 
     glfwSetWindowPos(window, rect.left, rect.top);
     glfwMakeContextCurrent(window);
@@ -104,17 +266,18 @@ void OverlayThread(HMODULE hModule) {
 
     HWND overlay_hwnd = glfwGetWin32Window(window);
 
+    // Install keyboard hook (WH_KEYBOARD_LL works globally)
+    g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHookProc, GetModuleHandleW(nullptr), 0);
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.IniFilename = nullptr;
 
-    // Set clipboard callbacks
     io.SetClipboardTextFn = ClipboardSetText;
     io.GetClipboardTextFn = ClipboardGetText;
 
-    // Dark style
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
     style.WindowRounding = 6.0f;
@@ -131,8 +294,6 @@ void OverlayThread(HMODULE hModule) {
     bool showConsole = true;
     bool showDebug = true;
     bool showSettings = false;
-
-    // Settings
     bool debugPackets = true;
     bool debugCallbacks = true;
     bool debugTimer = true;
@@ -140,22 +301,19 @@ void OverlayThread(HMODULE hModule) {
     bool debugInventory = true;
     bool debugPlayers = true;
 
-    // Set overlay to interactive initially
+    // Start interactive
     SetWindowLongA(overlay_hwnd, GWL_EXSTYLE,
         WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW);
-    BringWindowToTop(overlay_hwnd);
+    SetForegroundWindow(overlay_hwnd);
 
     auto t0 = std::chrono::steady_clock::now();
 
     while (!glfwWindowShouldClose(window)) {
-        // Follow growtopia
         if (IsWindow(growtopia)) {
             RECT r;
             GetWindowRect(growtopia, &r);
-            int nw = r.right - r.left;
-            int nh = r.bottom - r.top;
             glfwSetWindowPos(window, r.left, r.top);
-            glfwSetWindowSize(window, nw, nh);
+            glfwSetWindowSize(window, r.right - r.left, r.bottom - r.top);
         } else {
             break;
         }
@@ -173,7 +331,8 @@ void OverlayThread(HMODULE hModule) {
             if (g_menuOpen) {
                 SetWindowLongA(overlay_hwnd, GWL_EXSTYLE,
                     WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW);
-                BringWindowToTop(overlay_hwnd);
+                SetWindowPos(overlay_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
                 SetForegroundWindow(overlay_hwnd);
             } else {
                 SetWindowLongA(overlay_hwnd, GWL_EXSTYLE,
@@ -183,7 +342,6 @@ void OverlayThread(HMODULE hModule) {
         }
         f1WasDown = f1Down;
 
-        // ImGui new frame
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -194,7 +352,6 @@ void OverlayThread(HMODULE hModule) {
             ImGui::Begin("Coems Executor  |  F1 to toggle##executor", &g_menuOpen,
                 ImGuiWindowFlags_NoCollapse);
 
-            // ── Menu Bar ──────────────────────────────────────────
             if (ImGui::BeginMenuBar()) {
                 if (ImGui::BeginMenu("Tools")) {
                     ImGui::MenuItem("Console", nullptr, &showConsole);
@@ -205,7 +362,7 @@ void OverlayThread(HMODULE hModule) {
                 ImGui::EndMenuBar();
             }
 
-            // ── Toolbar ───────────────────────────────────────────
+            // Toolbar
             bool running = executor.isRunning();
 
             ImGui::PushStyleColor(ImGuiCol_Button, running
@@ -248,7 +405,7 @@ void OverlayThread(HMODULE hModule) {
 
             ImGui::Separator();
 
-            // ── Layout ────────────────────────────────────────────
+            // Layout
             float bottomHeight = 0;
             if (showConsole) bottomHeight += 120;
             if (showDebug) bottomHeight += 100;
@@ -256,13 +413,11 @@ void OverlayThread(HMODULE hModule) {
             float editorHeight = ImGui::GetContentRegionAvail().y - bottomHeight;
             if (editorHeight < 80) editorHeight = 80;
 
-            // Script editor
             ImGui::BeginChild("Editor", ImVec2(0, editorHeight), true);
             ImGui::InputTextMultiline("##script", scriptBuf, sizeof(scriptBuf),
                 ImVec2(-1, -1), ImGuiInputTextFlags_AllowTabInput | ImGuiInputTextFlags_NoHorizontalScroll);
             ImGui::EndChild();
 
-            // Settings
             if (showSettings) {
                 ImGui::BeginChild("Settings", ImVec2(0, 75), true);
                 ImGui::Text("Debug Filters");
@@ -275,14 +430,11 @@ void OverlayThread(HMODULE hModule) {
                 ImGui::Checkbox("Inventory", &debugInventory);
                 ImGui::Checkbox("Players", &debugPlayers);
                 ImGui::NextColumn();
-                if (ImGui::Button("Clear Debug", ImVec2(-1, 0))) {
-                    g_debugLogs.clear();
-                }
+                if (ImGui::Button("Clear Debug", ImVec2(-1, 0))) g_debugLogs.clear();
                 ImGui::Columns(1);
                 ImGui::EndChild();
             }
 
-            // Debug output
             if (showDebug) {
                 ImGui::BeginChild("DebugOutput", ImVec2(0, 95), true);
                 {
@@ -298,15 +450,12 @@ void OverlayThread(HMODULE hModule) {
                         if (!debugPathfinding && entry.message.find("[PATH]") != std::string::npos) show = false;
                         if (!debugInventory && entry.message.find("[INV]") != std::string::npos) show = false;
                         if (!debugPlayers && entry.message.find("[PLAYER]") != std::string::npos) show = false;
-                        if (show) {
-                            ImGui::TextUnformatted(entry.message.c_str());
-                        }
+                        if (show) ImGui::TextUnformatted(entry.message.c_str());
                     }
                 }
                 ImGui::EndChild();
             }
 
-            // Console
             if (showConsole) {
                 ImGui::BeginChild("Console", ImVec2(0, 115), true);
                 {
@@ -341,11 +490,14 @@ void OverlayThread(HMODULE hModule) {
         glfwSwapBuffers(window);
     }
 
+    // Cleanup
+    if (g_keyboardHook) UnhookWindowsHookEx(g_keyboardHook);
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
     glfwDestroyWindow(window);
     glfwTerminate();
+    g_window = nullptr;
     FreeLibraryAndExitThread(hModule, 0);
 }
 
