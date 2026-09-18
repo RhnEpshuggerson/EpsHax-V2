@@ -52,18 +52,12 @@ void MainThread(HMODULE hModule) {
 
     consoleLog("[INFO] Hook installed via MinHook");
 
-    // Main loop — F1 toggle
+    // Main loop — keep alive, update timer
     auto t0 = std::chrono::steady_clock::now();
     while (true) {
         Sleep(50);
-
         auto now = std::chrono::steady_clock::now();
         g_currentTime = std::chrono::duration<float>(now - t0).count();
-
-        static bool f1Was = false;
-        bool f1Now = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
-        if (f1Now && !f1Was) g_MenuOpen = !g_MenuOpen;
-        f1Was = f1Now;
     }
 
     MH_DisableHook(MH_ALL_HOOKS);

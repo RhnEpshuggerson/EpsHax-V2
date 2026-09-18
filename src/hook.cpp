@@ -91,59 +91,12 @@ static LRESULT CALLBACK KeyHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode >= 0) {
         KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lParam;
         int vk = kb->vkCode;
-
-        if (vk == VK_F1) return CallNextHookEx(nullptr, nCode, wParam, lParam);
-        if (vk == VK_SNAPSHOT || vk == VK_LWIN || vk == VK_RWIN ||
-            vk == VK_APPS || vk == VK_SLEEP) {
-            return CallNextHookEx(nullptr, nCode, wParam, lParam);
+        bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+        static bool f1Was = false;
+        if (vk == VK_F1 && isDown && !f1Was) {
+            g_MenuOpen = !g_MenuOpen;
         }
-
-        bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-        bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-        if (alt && (vk == VK_TAB || vk == VK_F4)) return CallNextHookEx(nullptr, nCode, wParam, lParam);
-        if (ctrl && vk == VK_ESCAPE) return CallNextHookEx(nullptr, nCode, wParam, lParam);
-
-        if (g_MenuOpen) {
-            bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
-            bool isUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
-
-            if (isDown || isUp) {
-                ImGuiIO& io = ImGui::GetIO();
-                ImGuiKey imguiKey = VkToImGuiKey(vk);
-                if (imguiKey != ImGuiKey_None) io.AddKeyEvent(imguiKey, isDown);
-
-                if (io.KeyCtrl && isDown && vk == 'V') {
-                    if (OpenClipboard(nullptr)) {
-                        HANDLE hData = GetClipboardData(CF_UNICODETEXT);
-                        if (hData) {
-                            wchar_t* text = (wchar_t*)GlobalLock(hData);
-                            if (text) {
-                                for (int i = 0; text[i]; i++)
-                                    if (text[i] <= 127) io.AddInputCharacter((unsigned char)text[i]);
-                                GlobalUnlock(hData);
-                            }
-                        }
-                        CloseClipboard();
-                    }
-                }
-
-                if (isDown && !io.KeyCtrl && !io.KeyAlt && !io.KeySuper) {
-                    if (vk >= 0x20 && vk <= 0x7E) {
-                        char c = (char)vk;
-                        if (vk >= 'A' && vk <= 'Z' && !GetAsyncKeyState(VK_SHIFT)) c += 32;
-                        if (io.KeyShift) {
-                            const char* shifted = "~!@#$%^&*()_+{}|:\"<>?ASDFGHJKLQWERTYUIOPZXCVBNM";
-                            const char* normal = "`1234567890-=[]\\;',./asdfghjklqwertyuiopzxcvbnm";
-                            for (int i = 0; normal[i]; i++)
-                                if (c == normal[i]) { c = shifted[i]; break; }
-                        }
-                        io.AddInputCharacter((unsigned char)c);
-                    }
-                }
-
-                if (isDown && vk != VK_F1) return 1;
-            }
-        }
+        f1Was = isDown;
     }
     return CallNextHookEx(nullptr, nCode, wParam, lParam);
 }
@@ -173,15 +126,18 @@ static void ClipSetText(void*, const char* text) {
 
 // ── WndProc hook ─────────────────────────────────────────────────────
 LRESULT CALLBACK hkWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (g_MenuOpen && ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
-        return 1;
-
     if (g_MenuOpen) {
+        if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+            return 1;
+
         switch (msg) {
             case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK: SetCapture(hWnd); return 1;
             case WM_LBUTTONUP: ReleaseCapture(); return 1;
             case WM_RBUTTONDOWN: case WM_RBUTTONDBLCLK: case WM_RBUTTONUP: return 1;
             case WM_MOUSEMOVE: case WM_MOUSEWHEEL: return 1;
+            case WM_KEYDOWN: case WM_KEYUP: case WM_SYSKEYDOWN: case WM_SYSKEYUP:
+            case WM_CHAR: case WM_UNICHAR:
+                return 1;
         }
     }
 
