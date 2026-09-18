@@ -51,7 +51,19 @@ if(NOT lua_POPULATED)
     target_include_directories(lua PUBLIC ${lua_SOURCE_DIR}/src)
 endif()
 
-# ── ImGui (no GLFW, using Win32 + OpenGL3 backend) ───────────────────
+# ── MinHook (auto-download) ──────────────────────────────────────────
+FetchContent_Declare(
+    minhook
+    GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
+    GIT_TAG        master
+)
+FetchContent_GetProperties(minhook)
+if(NOT minhook_POPULATED)
+    FetchContent_Populate(minhook)
+    add_subdirectory(${minhook_SOURCE_DIR} ${minhook_BINARY_DIR})
+endif()
+
+# ── ImGui (Win32 + OpenGL3 backend) ─────────────────────────────────
 set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/libs/imgui)
 if(NOT EXISTS ${IMGUI_DIR}/imgui.h)
     message(FATAL_ERROR
@@ -81,5 +93,5 @@ add_library(coems_executor SHARED
     src/hook.cpp
 )
 target_include_directories(coems_executor PRIVATE src)
-target_link_libraries(coems_executor PRIVATE imgui lua opengl32)
+target_link_libraries(coems_executor PRIVATE imgui lua minhook opengl32)
 target_compile_definitions(coems_executor PRIVATE COEMS_EXPORTS)

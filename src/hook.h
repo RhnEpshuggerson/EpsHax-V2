@@ -1,6 +1,5 @@
 #pragma once
 #include <windows.h>
-#include <gl/GL.h>
 
 typedef BOOL(WINAPI* wglSwapBuffers_t)(HDC hdc);
 extern wglSwapBuffers_t o_wglSwapBuffers;
