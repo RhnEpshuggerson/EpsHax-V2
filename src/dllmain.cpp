@@ -19,8 +19,8 @@ float g_currentTime = 0;
 bool g_debugMode = false;
 std::mutex g_debugMutex;
 std::vector<LogEntry> g_debugLogs;
-bool g_menuOpen = true;
-GLFWwindow* g_window = nullptr;
+bool g_menuOpen = false;
+bool g_hookActive = false;
 
 void debugLog(const std::string& msg) {
     std::lock_guard<std::mutex> lock(g_debugMutex);
@@ -28,8 +28,8 @@ void debugLog(const std::string& msg) {
     if (g_debugLogs.size() > 1000) g_debugLogs.erase(g_debugLogs.begin());
 }
 
-// ── Keyboard hook for input when overlay doesn't have focus ──────────
-static ImGuiKey VkToImGuiKey(int vk) {
+// ── Keyboard hook ────────────────────────────────────────────────────
+static int VkToImGuiKey(int vk) {
     switch (vk) {
         case VK_TAB: return ImGuiKey_Tab;
         case VK_LEFT: return ImGuiKey_LeftArrow;
@@ -63,79 +63,73 @@ static ImGuiKey VkToImGuiKey(int vk) {
         case VK_RSHIFT: return ImGuiKey_RightShift;
         case VK_RCONTROL: return ImGuiKey_RightCtrl;
         case VK_RMENU: return ImGuiKey_RightAlt;
-        case '0': return ImGuiKey_0;
-        case '1': return ImGuiKey_1;
-        case '2': return ImGuiKey_2;
-        case '3': return ImGuiKey_3;
-        case '4': return ImGuiKey_4;
-        case '5': return ImGuiKey_5;
-        case '6': return ImGuiKey_6;
-        case '7': return ImGuiKey_7;
-        case '8': return ImGuiKey_8;
-        case '9': return ImGuiKey_9;
-        case 'A': return ImGuiKey_A;
-        case 'B': return ImGuiKey_B;
-        case 'C': return ImGuiKey_C;
-        case 'D': return ImGuiKey_D;
-        case 'E': return ImGuiKey_E;
-        case 'F': return ImGuiKey_F;
-        case 'G': return ImGuiKey_G;
-        case 'H': return ImGuiKey_H;
-        case 'I': return ImGuiKey_I;
-        case 'J': return ImGuiKey_J;
-        case 'K': return ImGuiKey_K;
-        case 'L': return ImGuiKey_L;
-        case 'M': return ImGuiKey_M;
-        case 'N': return ImGuiKey_N;
-        case 'O': return ImGuiKey_O;
-        case 'P': return ImGuiKey_P;
-        case 'Q': return ImGuiKey_Q;
-        case 'R': return ImGuiKey_R;
-        case 'S': return ImGuiKey_S;
-        case 'T': return ImGuiKey_T;
-        case 'U': return ImGuiKey_U;
-        case 'V': return ImGuiKey_V;
-        case 'W': return ImGuiKey_W;
-        case 'X': return ImGuiKey_X;
-        case 'Y': return ImGuiKey_Y;
-        case 'Z': return ImGuiKey_Z;
-        case VK_F1: return ImGuiKey_F1;
-        case VK_F2: return ImGuiKey_F2;
-        case VK_F3: return ImGuiKey_F3;
-        case VK_F4: return ImGuiKey_F4;
-        case VK_F5: return ImGuiKey_F5;
-        case VK_F6: return ImGuiKey_F6;
-        case VK_F7: return ImGuiKey_F7;
-        case VK_F8: return ImGuiKey_F8;
-        case VK_F9: return ImGuiKey_F9;
-        case VK_F10: return ImGuiKey_F10;
-        case VK_F11: return ImGuiKey_F11;
-        case VK_F12: return ImGuiKey_F12;
+        case '0': return ImGuiKey_0; case '1': return ImGuiKey_1;
+        case '2': return ImGuiKey_2; case '3': return ImGuiKey_3;
+        case '4': return ImGuiKey_4; case '5': return ImGuiKey_5;
+        case '6': return ImGuiKey_6; case '7': return ImGuiKey_7;
+        case '8': return ImGuiKey_8; case '9': return ImGuiKey_9;
+        case 'A': return ImGuiKey_A; case 'B': return ImGuiKey_B;
+        case 'C': return ImGuiKey_C; case 'D': return ImGuiKey_D;
+        case 'E': return ImGuiKey_E; case 'F': return ImGuiKey_F;
+        case 'G': return ImGuiKey_G; case 'H': return ImGuiKey_H;
+        case 'I': return ImGuiKey_I; case 'J': return ImGuiKey_J;
+        case 'K': return ImGuiKey_K; case 'L': return ImGuiKey_L;
+        case 'M': return ImGuiKey_M; case 'N': return ImGuiKey_N;
+        case 'O': return ImGuiKey_O; case 'P': return ImGuiKey_P;
+        case 'Q': return ImGuiKey_Q; case 'R': return ImGuiKey_R;
+        case 'S': return ImGuiKey_S; case 'T': return ImGuiKey_T;
+        case 'U': return ImGuiKey_U; case 'V': return ImGuiKey_V;
+        case 'W': return ImGuiKey_W; case 'X': return ImGuiKey_X;
+        case 'Y': return ImGuiKey_Y; case 'Z': return ImGuiKey_Z;
+        case VK_F1: return ImGuiKey_F1; case VK_F2: return ImGuiKey_F2;
+        case VK_F3: return ImGuiKey_F3; case VK_F4: return ImGuiKey_F4;
+        case VK_F5: return ImGuiKey_F5; case VK_F6: return ImGuiKey_F6;
+        case VK_F7: return ImGuiKey_F7; case VK_F8: return ImGuiKey_F8;
+        case VK_F9: return ImGuiKey_F9; case VK_F10: return ImGuiKey_F10;
+        case VK_F11: return ImGuiKey_F11; case VK_F12: return ImGuiKey_F12;
         default: return ImGuiKey_None;
     }
 }
 
 static LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode >= 0 && g_menuOpen && g_window) {
+    if (nCode >= 0) {
         KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lParam;
-        ImGuiIO& io = ImGui::GetIO();
+        int vk = kb->vkCode;
 
-        bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
-        bool isUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+        // Always let F1 through
+        if (vk == VK_F1) return CallNextHookEx(nullptr, nCode, wParam, lParam);
 
-        if (isDown || isUp) {
-            int vk = kb->vkCode;
-            ImGuiKey imguiKey = VkToImGuiKey(vk);
-            if (imguiKey != ImGuiKey_None) {
-                io.AddKeyEvent(imguiKey, isDown);
-            }
+        // Let system keys through (PrintScreen, Alt+Tab, Win key, Ctrl+Esc, etc.)
+        if (vk == VK_SNAPSHOT || vk == VK_LWIN || vk == VK_RWIN ||
+            vk == VK_APPS || vk == VK_SLEEP || vk == VK_VOLUME_MUTE ||
+            vk == VK_VOLUME_DOWN || vk == VK_VOLUME_UP ||
+            vk == VK_MEDIA_NEXT_TRACK || vk == VK_MEDIA_PREV_TRACK ||
+            vk == VK_MEDIA_STOP || vk == VK_MEDIA_PLAY_PAUSE ||
+            vk == VK_LAUNCH_MAIL || vk == VK_LAUNCH_MEDIA_SELECT) {
+            return CallNextHookEx(nullptr, nCode, wParam, lParam);
+        }
 
-            // Handle ctrl+a, ctrl+c, ctrl+v, ctrl+x
-            if (io.KeyCtrl && isDown) {
-                if (vk == 'A') { io.AddInputCharacterUTF16(1); } // select all handled by imgui
-                if (vk == 'C') { /* copy handled by clipboard */ }
-                if (vk == 'V') {
-                    // paste from clipboard
+        // Alt+Tab, Alt+F4, Ctrl+Esc, Ctrl+Shift+Esc
+        bool alt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+        bool ctrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        if (alt && (vk == VK_TAB || vk == VK_F4)) return CallNextHookEx(nullptr, nCode, wParam, lParam);
+        if (ctrl && vk == VK_ESCAPE) return CallNextHookEx(nullptr, nCode, wParam, lParam);
+        if (ctrl && (GetAsyncKeyState(VK_SHIFT) & 0x8000) && vk == VK_ESCAPE) return CallNextHookEx(nullptr, nCode, wParam, lParam);
+
+        // Only process when menu is open
+        if (g_menuOpen && g_hookActive) {
+            bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
+            bool isUp = (wParam == WM_KEYUP || wParam == WM_SYSKEYUP);
+
+            if (isDown || isUp) {
+                ImGuiIO& io = ImGui::GetIO();
+                ImGuiKey imguiKey = (ImGuiKey)VkToImGuiKey(vk);
+                if (imguiKey != ImGuiKey_None) {
+                    io.AddKeyEvent(imguiKey, isDown);
+                }
+
+                // Ctrl+V paste
+                if (io.KeyCtrl && isDown && vk == 'V') {
                     if (OpenClipboard(nullptr)) {
                         HANDLE hData = GetClipboardData(CF_UNICODETEXT);
                         if (hData) {
@@ -152,36 +146,29 @@ static LRESULT CALLBACK KeyboardHookProc(int nCode, WPARAM wParam, LPARAM lParam
                         CloseClipboard();
                     }
                 }
-                if (vk == 'X') { /* cut handled by imgui */ }
-            }
 
-            // Handle regular character input
-            if (isDown && !io.KeyCtrl && !io.KeyAlt && !io.KeySuper) {
-                if (vk >= 0x20 && vk <= 0x7E && vk != VK_CONTROL && vk != VK_MENU && vk != VK_SHIFT) {
-                    char c = (char)vk;
-                    if (vk >= 'A' && vk <= 'Z' && !GetAsyncKeyState(VK_SHIFT)) {
-                        c = c + 32; // to lowercase
-                    }
-                    if (io.KeyShift) {
-                        // Simple shift mapping for common keys
-                        const char* shifted = "~!@#$%^&*()_+{}|:\"<>?asdfghjklqwertyuiopzxcvbnm";
-                        const char* normal = "`1234567890-=[]\\;',./asdfghjklqwertyuiopzxcvbnm";
-                        for (int i = 0; normal[i]; i++) {
-                            if (c == normal[i]) { c = shifted[i]; break; }
+                // Character input (letters, numbers, symbols)
+                if (isDown && !io.KeyCtrl && !io.KeyAlt && !io.KeySuper) {
+                    if (vk >= 0x20 && vk <= 0x7E) {
+                        char c = (char)vk;
+                        if (vk >= 'A' && vk <= 'Z' && !GetAsyncKeyState(VK_SHIFT)) {
+                            c = c + 32;
                         }
+                        if (io.KeyShift) {
+                            const char* shifted = "~!@#$%^&*()_+{}|:\"<>?ASDFGHJKLQWERTYUIOPZXCVBNM";
+                            const char* normal = "`1234567890-=[]\\;',./asdfghjklqwertyuiopzxcvbnm";
+                            for (int i = 0; normal[i]; i++) {
+                                if (c == normal[i]) { c = shifted[i]; break; }
+                            }
+                        }
+                        io.AddInputCharacter((unsigned char)c);
                     }
-                    io.AddInputCharacter((unsigned char)c);
                 }
-            }
 
-            // Always let F1 through
-            if (vk == VK_F1) {
-                return CallNextHookEx(nullptr, nCode, wParam, lParam);
-            }
-
-            // Block keyboard input from reaching growtopia when menu is open
-            if (g_menuOpen && isDown) {
-                return 1;
+                // Block keyboard from reaching Growtopia
+                if (isDown && vk != VK_F1) {
+                    return 1;
+                }
             }
         }
     }
@@ -215,26 +202,34 @@ static void ClipboardSetText(void*, const char* text) {
     CloseClipboard();
 }
 
-// ── Find Growtopia window ────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────
+void GetGrowtopiaClientPos(HWND hwnd, int& x, int& y, int& w, int& h) {
+    RECT client;
+    GetClientRect(hwnd, &client);
+    POINT topLeft = { client.left, client.top };
+    ClientToScreen(hwnd, &topLeft);
+    x = topLeft.x;
+    y = topLeft.y;
+    w = client.right - client.left;
+    h = client.bottom - client.top;
+}
+
 HWND FindGrowtopia() {
     HWND hwnd = nullptr;
     hwnd = FindWindowA(nullptr, "Growtopia");
     if (!hwnd) hwnd = FindWindowA(nullptr, "Growtopia by Robinson Technologies");
-    if (!hwnd) hwnd = FindWindowA(nullptr, "Growtopia");
     return hwnd;
 }
 
-// ── ImGui Overlay Thread ─────────────────────────────────────────────
+// ── Overlay Thread ───────────────────────────────────────────────────
 void OverlayThread(HMODULE hModule) {
-    // Wait for Growtopia
     HWND growtopia = nullptr;
     while (!growtopia) {
         growtopia = FindGrowtopia();
         Sleep(500);
     }
-    Sleep(1500);
+    Sleep(1000);
 
-    // Init GLFW
     if (!glfwInit()) {
         FreeLibraryAndExitThread(hModule, 1);
         return;
@@ -247,34 +242,32 @@ void OverlayThread(HMODULE hModule) {
     glfwWindowHint(GLFW_MOUSE_PASSTHROUGH, GLFW_FALSE);
     glfwWindowHint(GLFW_FOCUS_ON_SHOW, GLFW_FALSE);
 
-    RECT rect;
-    GetWindowRect(growtopia, &rect);
-    int w = rect.right - rect.left;
-    int h = rect.bottom - rect.top;
+    int ox, oy, ow, oh;
+    GetGrowtopiaClientPos(growtopia, ox, oy, ow, oh);
 
-    GLFWwindow* window = glfwCreateWindow(w, h, "Coems Executor", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(ow, oh, "Coems Executor", nullptr, nullptr);
     if (!window) {
         glfwTerminate();
         FreeLibraryAndExitThread(hModule, 1);
         return;
     }
-    g_window = window;
 
-    glfwSetWindowPos(window, rect.left, rect.top);
+    glfwSetWindowPos(window, ox, oy);
     glfwMakeContextCurrent(window);
     glfwSwapInterval(1);
 
     HWND overlay_hwnd = glfwGetWin32Window(window);
 
-    // Install keyboard hook (WH_KEYBOARD_LL works globally)
-    g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHookProc, GetModuleHandleW(nullptr), 0);
+    // Start hidden (passthrough) — user presses F1 to show
+    g_menuOpen = false;
+    SetWindowLongA(overlay_hwnd, GWL_EXSTYLE,
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW);
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.IniFilename = nullptr;
-
     io.SetClipboardTextFn = ClipboardSetText;
     io.GetClipboardTextFn = ClipboardGetText;
 
@@ -287,6 +280,10 @@ void OverlayThread(HMODULE hModule) {
 
     ImGui_ImplGlfw_InitForOpenGL(window, false);
     ImGui_ImplOpenGL3_Init("#version 330");
+
+    // Install keyboard hook
+    g_keyboardHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyboardHookProc, GetModuleHandleW(nullptr), 0);
+    g_hookActive = true;
 
     LuaExecutor executor;
     char scriptBuf[16384] = "";
@@ -301,22 +298,19 @@ void OverlayThread(HMODULE hModule) {
     bool debugInventory = true;
     bool debugPlayers = true;
 
-    // Start interactive
-    SetWindowLongA(overlay_hwnd, GWL_EXSTYLE,
-        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW);
-    SetForegroundWindow(overlay_hwnd);
-
     auto t0 = std::chrono::steady_clock::now();
 
     while (!glfwWindowShouldClose(window)) {
-        if (IsWindow(growtopia)) {
-            RECT r;
-            GetWindowRect(growtopia, &r);
-            glfwSetWindowPos(window, r.left, r.top);
-            glfwSetWindowSize(window, r.right - r.left, r.bottom - r.top);
-        } else {
+        // Check if Growtopia is still alive
+        if (!IsWindow(growtopia)) {
             break;
         }
+
+        // Sync position and size with Growtopia client area
+        int nx, ny, nw, nh;
+        GetGrowtopiaClientPos(growtopia, nx, ny, nw, nh);
+        glfwSetWindowPos(window, nx, ny);
+        glfwSetWindowSize(window, nw, nh);
 
         glfwPollEvents();
 
@@ -334,6 +328,7 @@ void OverlayThread(HMODULE hModule) {
                 SetWindowPos(overlay_hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
                 SetForegroundWindow(overlay_hwnd);
+                BringWindowToTop(overlay_hwnd);
             } else {
                 SetWindowLongA(overlay_hwnd, GWL_EXSTYLE,
                     WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW);
@@ -342,6 +337,7 @@ void OverlayThread(HMODULE hModule) {
         }
         f1WasDown = f1Down;
 
+        // ImGui new frame
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -491,13 +487,18 @@ void OverlayThread(HMODULE hModule) {
     }
 
     // Cleanup
-    if (g_keyboardHook) UnhookWindowsHookEx(g_keyboardHook);
+    g_hookActive = false;
+    g_menuOpen = false;
+    if (g_keyboardHook) {
+        UnhookWindowsHookEx(g_keyboardHook);
+        g_keyboardHook = nullptr;
+    }
+    executor.stop();
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
     glfwDestroyWindow(window);
     glfwTerminate();
-    g_window = nullptr;
     FreeLibraryAndExitThread(hModule, 0);
 }
 
