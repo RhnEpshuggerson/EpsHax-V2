@@ -394,3 +394,30 @@ namespace scanner {
         memset(g_sendStrBuf, 0, 32);
     }
 }
+
+uintptr_t scanner::fn_RecvWrapper = 0;
+
+void scanner::ScanRecvWrapper() {
+    uintptr_t recvRetAddr = 0x1419EBD08;
+    char buf[256];
+
+    uintptr_t funcStart = FindFuncStart(recvRetAddr);
+    if (funcStart) {
+        snprintf(buf, sizeof(buf), "[SCAN] Recv wrapper: 0x%p (from ret addr 0x%p)", (void*)funcStart, (void*)recvRetAddr);
+        consoleLog(buf);
+
+        BYTE* codeBytes = (BYTE*)funcStart;
+        char hex[128] = {};
+        int pos = 0;
+        for (int i = 0; i < 32 && pos < 120; i++) {
+            pos += snprintf(hex + pos, 128 - pos, "%02X ", codeBytes[i]);
+        }
+        snprintf(buf, sizeof(buf), "[SCAN] RW bytes: %s", hex);
+        consoleLog(buf);
+
+        fn_RecvWrapper = funcStart;
+    } else {
+        snprintf(buf, sizeof(buf), "[SCAN] Could not find recv wrapper start from 0x%p", (void*)recvRetAddr);
+        consoleLog(buf);
+    }
+}

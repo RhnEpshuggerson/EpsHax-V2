@@ -196,11 +196,16 @@ int WINAPI hk_send(SOCKET s, const char* buf, int len, int flags) {
         GameState::instance().parseOutgoing(buf, len);
     }
     g_SendCount++;
-    if (g_SendCount <= 10) {
+    if (g_SendCount <= 30) {
         void* retAddr = _ReturnAddress();
-        char buf2[256];
-        snprintf(buf2, sizeof(buf2), "[send #%d] len=%d ret=0x%p",
-            g_SendCount, len, retAddr);
+        char hex[128] = {};
+        int pos = 0;
+        for (int i = 0; i < 32 && i < len && pos < 120; i++) {
+            pos += snprintf(hex + pos, 128 - pos, "%02X ", (unsigned char)buf[i]);
+        }
+        char buf2[512];
+        snprintf(buf2, sizeof(buf2), "[SEND #%d] len=%d ret=0x%p %s",
+            g_SendCount, len, retAddr, hex);
         consoleLog(buf2);
     }
     return o_send(s, buf, len, flags);
@@ -214,11 +219,16 @@ int WINAPI hk_recv(SOCKET s, char* buf, int len, int flags) {
         GameState::instance().parseIncoming(buf, result);
     }
     g_RecvCount++;
-    if (g_RecvCount <= 10) {
+    if (g_RecvCount <= 30 && result > 0) {
         void* retAddr = _ReturnAddress();
-        char buf2[256];
-        snprintf(buf2, sizeof(buf2), "[recv #%d] len=%d ret=0x%p",
-            g_RecvCount, result, retAddr);
+        char hex[128] = {};
+        int pos = 0;
+        for (int i = 0; i < 32 && i < result && pos < 120; i++) {
+            pos += snprintf(hex + pos, 128 - pos, "%02X ", (unsigned char)buf[i]);
+        }
+        char buf2[512];
+        snprintf(buf2, sizeof(buf2), "[RECV #%d] len=%d ret=0x%p %s",
+            g_RecvCount, result, retAddr, hex);
         consoleLog(buf2);
     }
     return result;
@@ -313,6 +323,82 @@ static void InstallSocketHooks(HMODULE hWS2) {
 }
 
 bool g_SocketHooksInstalled = false;
+
+// ── TLS hooks (DecryptMessage) ──────────────────────────────────────
+#define SECURITY_WIN32
+#include <windows.h>
+#include <sspi.h>
+#include <security.h>
+
+typedef SECURITY_STATUS(WINAPI* DecryptMessage_t)(PCtxtHandle, PSecBufferDesc, ULONG, PULONG);
+static DecryptMessage_t o_DecryptMessage = nullptr;
+static int g_TlsCount = 0;
+
+SECURITY_STATUS WINAPI hk_DecryptMessage(PCtxtHandle phContext, PSecBufferDesc pMessage, ULONG MessageSeqNo, PULONG pulQOP) {
+    SECURITY_STATUS status = o_DecryptMessage(phContext, pMessage, MessageSeqNo, pulQOP);
+
+    if (status == SEC_E_OK && pMessage && pMessage->cBuffers >= 1) {
+        for (ULONG i = 0; i < pMessage->cBuffers; i++) {
+            SecBuffer* buf = &pMessage->pBuffers[i];
+            if (buf->BufferType == SECBUFFER_DATA && buf->cbBuffer > 4 && buf->pvBuffer) {
+                BYTE* data = (BYTE*)buf->pvBuffer;
+                uint32_t header = *(uint32_t*)data;
+                int pktType = header & 0xFF;
+
+                g_TlsCount++;
+                if (g_TlsCount <= 50) {
+                    char hex[128] = {};
+                    int pos = 0;
+                    for (int j = 0; j < 32 && j < (int)buf->cbBuffer && pos < 120; j++) {
+                        pos += snprintf(hex + pos, 128 - pos, "%02X ", data[j]);
+                    }
+                    char buf2[512];
+                    snprintf(buf2, sizeof(buf2), "[TLS #%d] type=%d len=%d %s",
+                        g_TlsCount, pktType, buf->cbBuffer, hex);
+                    consoleLog(buf2);
+                }
+
+                if (pktType == 4 && buf->cbBuffer > 4) {
+                    std::string text((char*)(data + 4), buf->cbBuffer - 4);
+                    if (text.size() > 2) {
+                        GameState::instance().parseTextPacket(text, true);
+                    }
+                }
+
+                if ((pktType == 1 || pktType == 2 || pktType == 3) && buf->cbBuffer >= 16) {
+                    GameState::instance().parseIncoming((const char*)data, buf->cbBuffer);
+                }
+            }
+        }
+    }
+
+    return status;
+}
+
+void TryInstallTLSHooks() {
+    HMODULE hSec = GetModuleHandleA("sspicli.dll");
+    if (!hSec) hSec = GetModuleHandleA("secur32.dll");
+    if (!hSec) hSec = GetModuleHandleA("schannel.dll");
+    if (!hSec) {
+        consoleLog("[INFO] No Windows TLS DLL loaded (sspicli/secur32/schannel) - game uses own TLS");
+        return;
+    }
+    auto addr = (void*)GetProcAddress(hSec, "DecryptMessage");
+    if (!addr) addr = (void*)GetProcAddress(hSec, "SslDecryptPacket");
+    if (addr) {
+        MH_STATUS st = MH_CreateHook(addr, (void*)hk_DecryptMessage, (void**)&o_DecryptMessage);
+        if (st == MH_OK) {
+            MH_EnableHook(addr);
+            consoleLog("[INFO] TLS decrypt hook installed OK");
+        } else {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "[WARN] TLS decrypt hook failed: %d", (int)st);
+            consoleLog(buf);
+        }
+    } else {
+        consoleLog("[INFO] DecryptMessage/SslDecryptPacket not exported - game uses own TLS");
+    }
+}
 
 // ── Game function pointers (resolved by scanner) ──────────────────────
 static void* g_GameLogicPtr = nullptr;
@@ -426,6 +512,9 @@ void MainThread(HMODULE hModule) {
     // ── Force load ws2_32 if not yet loaded ──────────────────────
     TryInstallSocketHooks();
 
+    // ── Hook TLS decryption ──────────────────────────────────────
+    TryInstallTLSHooks();
+
     // ── Scan for game functions in ALL executable memory ──────────
     HMODULE hGame = GetModuleHandleA(NULL);
     if (hGame) {
@@ -465,13 +554,75 @@ void MainThread(HMODULE hModule) {
         consoleLog("[FAIL] ProcessTankUpdatePacket NOT FOUND");
     }
 
-    // ── Main loop ────────────────────────────────────────────────
+    // ── Main loop (periodic heap scan for plaintext packets) ─────
     auto t0 = std::chrono::steady_clock::now();
+    int scanCycle = 0;
+    static const char* scanPatterns[] = {
+        "action|", "OnSpawn", "setPos", "gamePacket", "name|",
+        "inet|", "platformID|", "country|", "tankID|", "netID|"
+    };
     while (true) {
-        Sleep(50);
+        Sleep(100);
         auto now = std::chrono::steady_clock::now();
         float elapsed = std::chrono::duration<float>(now - t0).count();
         g_currentTime = elapsed;
+
+        scanCycle++;
+        if (scanCycle % 20 == 0) {
+            uintptr_t ranges[][2] = {
+                {0x140000000, 0x150000000},
+                {0x20000000,  0x40000000},
+                {0,           0}
+            };
+            for (int r = 0; ranges[r][1] > ranges[r][0]; r++) {
+                uintptr_t addr = ranges[r][0];
+                uintptr_t end  = ranges[r][1];
+                while (addr < end) {
+                    MEMORY_BASIC_INFORMATION mbi;
+                    memset(&mbi, 0, sizeof(mbi));
+                    if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) break;
+                    if (mbi.State == MEM_COMMIT && (mbi.Protect == PAGE_READWRITE || mbi.Protect == PAGE_EXECUTE_READWRITE) && mbi.RegionSize > 0 && mbi.RegionSize < 0x400000) {
+                        BYTE* regionStart = (BYTE*)mbi.BaseAddress;
+                        size_t regionSize = mbi.RegionSize;
+                        for (int p = 0; p < 10; p++) {
+                            const char* needle = scanPatterns[p];
+                            size_t needleLen = strlen(needle);
+                            for (size_t i = 0; i <= regionSize - needleLen; i++) {
+                                if (memcmp(regionStart + i, needle, needleLen) == 0) {
+                                    const char* textStart = (const char*)(regionStart + i);
+                                    size_t maxLen = regionSize - i;
+                                    size_t textLen = strnlen(textStart, maxLen < 512 ? maxLen : 512);
+                                    if (textLen > 10 && textLen < 512) {
+                                        bool printable = true;
+                                        for (size_t j = 0; j < textLen && j < 30; j++) {
+                                            unsigned char c = (unsigned char)textStart[j];
+                                            if (c < 0x09 || (c > 0x0D && c < 0x20) || c == 0x7F) {
+                                                printable = false;
+                                                break;
+                                            }
+                                        }
+                                        if (printable) {
+                                            std::string preview(textStart, textLen < 150 ? textLen : 150);
+                                            for (auto& ch : preview) { if (ch == '\n') ch = '|'; }
+                                            static std::string lastFound;
+                                            if (preview != lastFound) {
+                                                lastFound = preview;
+                                                std::lock_guard<std::mutex> lock(g_debugMutex);
+                                                g_debugLogs.push_back({ "[HEAP] " + preview, g_currentTime });
+                                                if (g_debugLogs.size() > 1000) g_debugLogs.erase(g_debugLogs.begin());
+                                            }
+                                        }
+                                    }
+                                    i += textLen > 0 ? textLen - 1 : 0;
+                                }
+                            }
+                        }
+                    }
+                    addr = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+                    if (addr <= (uintptr_t)mbi.BaseAddress) break;
+                }
+            }
+        }
     }
 
     MH_DisableHook(MH_ALL_HOOKS);
