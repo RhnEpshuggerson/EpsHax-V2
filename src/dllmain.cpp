@@ -436,10 +436,6 @@ void TryInstallTLSHooks() {
     }
 }
 
-// ── Game function pointers (resolved by scanner) ──────────────────────
-static void* g_GameLogicPtr = nullptr;
-static bool g_GameLogicCaptured = false;
-
 void TryInstallSocketHooks() {
     if (g_SocketHooksInstalled) return;
     HMODULE hWS2 = GetModuleHandleA("ws2_32.dll");
@@ -454,80 +450,12 @@ void TryInstallSocketHooks() {
     }
 }
 
-
-
-// ── ProcessTankUpdatePacket hook (decrypted packets) ────────────────
-typedef void(__fastcall* PTUP_t)(void* logic, void* packet);
-static PTUP_t o_ProcessTankUpdatePacket = nullptr;
-static int g_PTUPCount = 0;
-
-void __fastcall hk_ProcessTankUpdatePacket(void* logic, void* packet) {
-    if (!packet) { if (o_ProcessTankUpdatePacket) o_ProcessTankUpdatePacket(logic, packet); return; }
-
-    BYTE* pkt = (BYTE*)packet;
-    uint8_t pktType = pkt[0];
-    uint16_t pktSize = *(uint16_t*)(pkt + 2);
-
-    g_PTUPCount++;
-    if (g_PTUPCount <= 50) {
-        // Log first 64 bytes of every packet
-        char hex[256] = {};
-        int pos = 0;
-        for (int i = 0; i < 64 && i < pktSize && pos < 250; i++) {
-            pos += snprintf(hex + pos, 256 - pos, "%02X ", pkt[i]);
-        }
-        char buf[512];
-        snprintf(buf, sizeof(buf), "[PTUP #%d] type=%d size=%d %s", g_PTUPCount, pktType, pktSize, hex);
-        consoleLog(buf);
-    }
-
-    // Parse text packets (type 4)
-    if (pktType == 4 && pktSize > 4) {
-        std::string text((char*)(pkt + 4), pktSize - 4);
-        if (text.size() > 2) {
-            GameState::instance().parseTextPacket(text, true);
-        }
-    }
-
-    // Parse tank update packets (type 1, 2, 3) for player positions
-    if (pktType == 1 && pktSize >= 56) {
-        int netid = *(int*)(pkt + 4);
-        float pos_x = *(float*)(pkt + 16);
-        float pos_y = *(float*)(pkt + 20);
-        int item = *(int*)(pkt + 44);
-
-        auto& gs = GameState::instance();
-        std::lock_guard<std::mutex> lock(gs.mtx);
-        for (auto& p : gs.players) {
-            if (p.netid == netid) {
-                p.pos_x = pos_x;
-                p.pos_y = pos_y;
-                p.tile_x = (int)(pos_x / 32);
-                p.tile_y = (int)(pos_y / 32);
-                if (item != -1) p.item = item;
-                break;
-            }
-        }
-        if (netid == gs.localPlayer.netid || netid == -1) {
-            gs.localPlayer.pos_x = pos_x;
-            gs.localPlayer.pos_y = pos_y;
-            gs.localPlayer.tile_x = (int)(pos_x / 32);
-            gs.localPlayer.tile_y = (int)(pos_y / 32);
-            if (item != -1) gs.localPlayer.item = item;
-        }
-    }
-
-    if (o_ProcessTankUpdatePacket)
-        o_ProcessTankUpdatePacket(logic, packet);
-}
-
 // ── Main thread ──────────────────────────────────────────────────────
 
 void MainThread(HMODULE hModule) {
     while (!GetModuleHandleA("opengl32.dll")) Sleep(100);
     Sleep(500);
 
-    // ── Hook wglSwapBuffers ──────────────────────────────────────
     HMODULE hOGL = GetModuleHandleA("opengl32.dll");
     auto p_wglSwapBuffers = (void*)GetProcAddress(hOGL, "wglSwapBuffers");
 
@@ -545,120 +473,19 @@ void MainThread(HMODULE hModule) {
         consoleLog("[INFO] wglSwapBuffers hook installed");
     }
 
-    // ── Force load ws2_32 if not yet loaded ──────────────────────
     TryInstallSocketHooks();
-
-    // ── Hook TLS decryption ──────────────────────────────────────
     TryInstallTLSHooks();
 
-    // ── Scan for game functions in ALL executable memory ──────────
     HMODULE hGame = GetModuleHandleA(NULL);
     if (hGame) {
         scanner::Install(hGame);
     }
 
-    // ── Hook ProcessTankUpdatePacket (decrypted packets) ─────────
-    if (scanner::fn_ProcessTankUpdatePacket) {
-        uintptr_t ptupAddr = scanner::fn_ProcessTankUpdatePacket;
-
-        MEMORY_BASIC_INFORMATION mbi;
-        VirtualQuery((void*)ptupAddr, &mbi, sizeof(mbi));
-        char buf2[256];
-        snprintf(buf2, sizeof(buf2), "[INFO] PTUP addr=0x%p prot=0x%X state=0x%X",
-            (void*)ptupAddr, mbi.Protect, mbi.State);
-        consoleLog(buf2);
-
-        BYTE* codeBytes = (BYTE*)ptupAddr;
-        char hex[128] = {};
-        int pos = 0;
-        for (int i = 0; i < 32 && pos < 120; i++) {
-            pos += snprintf(hex + pos, 128 - pos, "%02X ", codeBytes[i]);
-        }
-        snprintf(buf2, sizeof(buf2), "[INFO] PTUP bytes: %s", hex);
-        consoleLog(buf2);
-
-        auto pPTUP = (PTUP_t)ptupAddr;
-        MH_STATUS st = MH_CreateHook((void*)pPTUP, (void*)hk_ProcessTankUpdatePacket, (void**)&o_ProcessTankUpdatePacket);
-        snprintf(buf2, sizeof(buf2), "[INFO] MH_CreateHook PTUP: %d", (int)st);
-        consoleLog(buf2);
-        if (st == MH_OK) {
-            MH_STATUS st2 = MH_EnableHook((void*)pPTUP);
-            snprintf(buf2, sizeof(buf2), "[INFO] MH_EnableHook PTUP: %d", (int)st2);
-            consoleLog(buf2);
-        }
-    } else {
-        consoleLog("[FAIL] ProcessTankUpdatePacket NOT FOUND");
-    }
-
-    // ── Main loop (periodic heap scan for plaintext packets) ─────
     auto t0 = std::chrono::steady_clock::now();
-    int scanCycle = 0;
-    static const char* scanPatterns[] = {
-        "action|", "OnSpawn", "setPos", "gamePacket", "name|",
-        "inet|", "platformID|", "country|", "tankID|", "netID|"
-    };
     while (true) {
         Sleep(100);
         auto now = std::chrono::steady_clock::now();
-        float elapsed = std::chrono::duration<float>(now - t0).count();
-        g_currentTime = elapsed;
-
-        scanCycle++;
-        if (scanCycle % 20 == 0) {
-            uintptr_t ranges[][2] = {
-                {0x140000000, 0x150000000},
-                {0x20000000,  0x40000000},
-                {0,           0}
-            };
-            for (int r = 0; ranges[r][1] > ranges[r][0]; r++) {
-                uintptr_t addr = ranges[r][0];
-                uintptr_t end  = ranges[r][1];
-                while (addr < end) {
-                    MEMORY_BASIC_INFORMATION mbi;
-                    memset(&mbi, 0, sizeof(mbi));
-                    if (!VirtualQuery((LPCVOID)addr, &mbi, sizeof(mbi))) break;
-                    if (mbi.State == MEM_COMMIT && (mbi.Protect == PAGE_READWRITE || mbi.Protect == PAGE_EXECUTE_READWRITE) && mbi.RegionSize > 0 && mbi.RegionSize < 0x400000) {
-                        BYTE* regionStart = (BYTE*)mbi.BaseAddress;
-                        size_t regionSize = mbi.RegionSize;
-                        for (int p = 0; p < 10; p++) {
-                            const char* needle = scanPatterns[p];
-                            size_t needleLen = strlen(needle);
-                            for (size_t i = 0; i <= regionSize - needleLen; i++) {
-                                if (memcmp(regionStart + i, needle, needleLen) == 0) {
-                                    const char* textStart = (const char*)(regionStart + i);
-                                    size_t maxLen = regionSize - i;
-                                    size_t textLen = strnlen(textStart, maxLen < 512 ? maxLen : 512);
-                                    if (textLen > 10 && textLen < 512) {
-                                        bool printable = true;
-                                        for (size_t j = 0; j < textLen && j < 30; j++) {
-                                            unsigned char c = (unsigned char)textStart[j];
-                                            if (c < 0x09 || (c > 0x0D && c < 0x20) || c == 0x7F) {
-                                                printable = false;
-                                                break;
-                                            }
-                                        }
-                                        if (printable) {
-                                            std::string preview(textStart, textLen < 150 ? textLen : 150);
-                                            for (auto& ch : preview) { if (ch == '\n') ch = '|'; }
-                                            static std::string lastFound;
-                                            if (preview != lastFound) {
-                                                lastFound = preview;
-                                                std::lock_guard<std::mutex> lock(g_debugMutex);
-                                                g_debugLogs.push_back({ "[HEAP] " + preview, g_currentTime });
-                                                if (g_debugLogs.size() > 1000) g_debugLogs.erase(g_debugLogs.begin());
-                                            }
-                                        }
-                                    }
-                                    i += textLen > 0 ? textLen - 1 : 0;
-                                }
-                            }
-                        }
-                    }
-                    addr = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
-                    if (addr <= (uintptr_t)mbi.BaseAddress) break;
-                }
-            }
-        }
+        g_currentTime = std::chrono::duration<float>(now - t0).count();
     }
 
     MH_DisableHook(MH_ALL_HOOKS);
