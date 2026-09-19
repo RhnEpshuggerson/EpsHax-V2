@@ -11,6 +11,8 @@
 #include <mutex>
 #include <MinHook.h>
 #include <intrin.h>
+#include <dbghelp.h>
+#pragma comment(lib, "dbghelp.lib")
 
 float g_currentTime = 0;
 
@@ -212,6 +214,7 @@ int WINAPI hk_send(SOCKET s, const char* buf, int len, int flags) {
 }
 
 static int g_RecvCount = 0;
+static int g_TlsAppDataCount = 0;
 
 int WINAPI hk_recv(SOCKET s, char* buf, int len, int flags) {
     int result = o_recv(s, buf, len, flags);
@@ -219,6 +222,39 @@ int WINAPI hk_recv(SOCKET s, char* buf, int len, int flags) {
         GameState::instance().parseIncoming(buf, result);
     }
     g_RecvCount++;
+    if (result >= 5 && buf) {
+        bool isTlsAppData = ((unsigned char)buf[0] == 0x17 &&
+                             (unsigned char)buf[1] == 0x03 &&
+                             (unsigned char)buf[2] == 0x03);
+        if (isTlsAppData && g_TlsAppDataCount < 3) {
+            g_TlsAppDataCount++;
+            void* frames[64] = {};
+            USHORT frameCount = CaptureStackBackTrace(0, 64, frames, NULL);
+            char hex[256] = {};
+            int pos = 0;
+            for (int i = 0; i < 32 && i < result && pos < 240; i++) {
+                pos += snprintf(hex + pos, 240 - pos, "%02X ", (unsigned char)buf[i]);
+            }
+            char msg[4096];
+            int m = snprintf(msg, sizeof(msg),
+                "[TLS-APPDATA #%d] len=%d frames=%d\n  DATA: %s\n  FRAMES:",
+                g_TlsAppDataCount, result, frameCount, hex);
+            for (USHORT i = 0; i < frameCount && m < 3900; i++) {
+                m += snprintf(msg + m, 3900 - m, "\n  [%d] 0x%p", i, frames[i]);
+                MEMORY_BASIC_INFORMATION mbi = {};
+                if (VirtualQuery(frames[i], &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT) {
+                    unsigned char* bytes = (unsigned char*)frames[i];
+                    m += snprintf(msg + m, 3900 - m, " bytes=");
+                    for (int b = 0; b < 16 && m < 3900; b++) {
+                        m += snprintf(msg + m, 3900 - m, "%02X ", bytes[b]);
+                    }
+                } else {
+                    m += snprintf(msg + m, 3900 - m, " [unmapped]");
+                }
+            }
+            consoleLog(msg);
+        }
+    }
     if (g_RecvCount <= 30 && result > 0) {
         void* retAddr = _ReturnAddress();
         char hex[128] = {};
