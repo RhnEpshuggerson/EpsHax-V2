@@ -51,18 +51,23 @@ public:
     bool execute(const std::string& script);
     void stop();
     bool isRunning() const { return running; }
+    void tick(float dt);
 
     void registerAPI();
 
     lua_State* getLuaState() { return L; }
+    void setTickInterval(float s) { tickInterval = s; }
+
+    std::vector<CallbackInfo> callbacks;
+    std::vector<TimerInfo> timers;
+    std::vector<LuaThreadInfo> threads;
 
 private:
     lua_State* L = nullptr;
     std::atomic<bool> running{false};
-    std::vector<CallbackInfo> callbacks;
-    std::vector<TimerInfo> timers;
-    std::vector<LuaThreadInfo> threads;
     float startTime = 0;
+    float lastTickTime = 0;
+    float tickInterval = 1.0f;
 
     static int lua_SendPacket(lua_State* L);
     static int lua_SendPacketRaw(lua_State* L);
@@ -91,5 +96,9 @@ private:
     static int lua_timer_Create(lua_State* L);
     static int lua_timer_Destroy(lua_State* L);
     static int lua_timer_Update(lua_State* L);
+    static int lua_GetGhost(lua_State* L);
+    static int lua_GetAccesslist(lua_State* L);
+    static int lua_GetLocalObject(lua_State* L);
+    static int lua_GetDroppedItems(lua_State* L);
     static int lua_AddCallback(lua_State* L);
 };

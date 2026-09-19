@@ -89,12 +89,13 @@ static bool showConsole = true;
 static bool showDebug = true;
 static bool showSettings = false;
 static bool autoScroll = true;
-static bool debugPackets = true;
+static bool debugPackets = false;
 static bool debugCallbacks = true;
 static bool debugTimer = true;
-static bool debugPathfinding = true;
-static bool debugInventory = true;
-static bool debugPlayers = true;
+static bool debugPathfinding = false;
+static bool debugInventory = false;
+static bool debugPlayers = false;
+static float g_TickInterval = 1.0f;
 static char scriptBuf[16384] = "";
 static LuaExecutor* g_executor = nullptr;
 
@@ -144,7 +145,14 @@ void GameState::parseTextPacket(const std::string& text, bool incoming) {
     if (text.size() < 4) return;
 
     auto kv = parseTextLines(text);
-    std::string action = kv["action"];
+    std::string action = kv.count("action") ? kv["action"] : "";
+
+    // Always log incoming text packet action for debugging
+    if (incoming) {
+        std::string preview = text.substr(0, 150);
+        for (auto& c : preview) { if (c == '\n') c = '|'; }
+        consoleLog("[IN] action=[" + action + "] " + preview);
+    }
 
     if (action == "spawn" || action == "on_spawn") {
         std::lock_guard<std::mutex> lock(mtx);
@@ -159,6 +167,9 @@ void GameState::parseTextPacket(const std::string& text, bool incoming) {
             p.size_x = safeFloat(kv.count("sizeX") ? kv["sizeX"] : "0");
             p.size_y = safeFloat(kv.count("sizeY") ? kv["sizeY"] : "0");
             p.world = kv.count("world") ? kv["world"] : "";
+
+            debugLog("[SPAWN] name=" + p.name + " world=" + p.world +
+                " netid=" + std::to_string(p.netid));
 
             bool found = false;
             for (auto& existing : players) {
@@ -177,6 +188,8 @@ void GameState::parseTextPacket(const std::string& text, bool incoming) {
         std::lock_guard<std::mutex> lock(mtx);
         std::string msg = kv.count("msg") ? kv["msg"] : "";
 
+        debugLog("[VARLIST] msg=" + msg);
+
         if (msg == "OnSetBux" || msg.find("SetBux") != std::string::npos) {
             if (kv.count("1")) localPlayer.gems = safeInt(kv["1"]);
         }
@@ -189,6 +202,8 @@ void GameState::parseTextPacket(const std::string& text, bool incoming) {
     }
 
     if (action == "set_field_init" || action == "set_field_update") {
+        debugLog("[FIELD] type=" + (kv.count("type") ? kv["type"] : "?") +
+            " value=" + (kv.count("value") ? kv["value"] : "?"));
         std::lock_guard<std::mutex> lock(mtx);
         if (kv.count("type")) {
             std::string fieldType = kv["type"];
@@ -238,29 +253,31 @@ void GameState::parseTextPacket(const std::string& text, bool incoming) {
 
 void GameState::parseIncoming(const char* data, int len) {
     if (len < 4) return;
-    uint32_t header = *(uint32_t*)data;
 
-    if ((header & 0xFF) == 4 || header == 0 || (header & 0xFFFF) == 0) {
+    uint32_t header = *(uint32_t*)data;
+    int pktType = header & 0xFF;
+
+    if (pktType == 4) {
         std::string text(data + 4, len - 4);
         if (text.size() > 2) {
-            debugLog("[PACKET IN] " + text.substr(0, 200));
             parseTextPacket(text, true);
         }
         return;
     }
 
-    int pktType = header & 0xFF;
-    if (len >= (int)sizeof(uint32_t) * 4) {
+    if (pktType == 1 || pktType == 2 || pktType == 3) {
         PacketEvent ev;
         ev.type = "OnRawPacket";
         ev.packet_type = pktType;
-        if (len >= 24) ev.netid = *(int*)(data + 8);
-        if (len >= 28) ev.item = *(int*)(data + 12);
-        if (len >= 36) { ev.pos_x = *(float*)(data + 16); ev.pos_y = *(float*)(data + 20); }
-        if (len >= 44) { ev.pos2_x = *(float*)(data + 24); ev.pos2_y = *(float*)(data + 28); }
-        if (len >= 32) ev.flags = *(int*)(data + 32);
+        if (len >= 16) ev.netid = *(int*)(data + 8);
+        if (len >= 20) ev.item = *(int*)(data + 12);
+        if (len >= 28) { ev.pos_x = *(float*)(data + 16); ev.pos_y = *(float*)(data + 20); }
+        if (len >= 36) { ev.pos2_x = *(float*)(data + 24); ev.pos2_y = *(float*)(data + 28); }
+        if (len >= 24) ev.flags = *(int*)(data + 20);
 
-        if (pktType == 0) {
+        debugLog("[PKT RAW] type=" + std::to_string(pktType) + " netid=" + std::to_string(ev.netid));
+
+        if (pktType == 1) {
             std::lock_guard<std::mutex> lock(mtx);
             for (auto& p : players) {
                 if (p.netid == ev.netid) {
@@ -281,36 +298,33 @@ void GameState::parseIncoming(const char* data, int len) {
             }
         }
 
-        debugLog("[PACKET IN RAW] type=" + std::to_string(pktType) +
-            " netid=" + std::to_string(ev.netid));
         pushEvent(ev);
+        return;
     }
 }
 
 void GameState::parseOutgoing(const char* data, int len) {
     if (len < 4) return;
-    uint32_t header = *(uint32_t*)data;
 
-    if ((header & 0xFF) == 4 || header == 0 || (header & 0xFFFF) == 0) {
+    uint32_t header = *(uint32_t*)data;
+    int pktType = header & 0xFF;
+
+    if (pktType == 4) {
         std::string text(data + 4, len - 4);
         if (text.size() > 2) {
-            debugLog("[PACKET OUT] " + text.substr(0, 200));
             parseTextPacket(text, false);
         }
         return;
     }
 
-    int pktType = header & 0xFF;
-    if (len >= (int)sizeof(uint32_t) * 4) {
+    if (pktType == 1 || pktType == 2 || pktType == 3) {
         PacketEvent ev;
         ev.type = "OnPacket";
         ev.packet_type = pktType;
-        if (len >= 24) ev.netid = *(int*)(data + 8);
-        if (len >= 28) ev.item = *(int*)(data + 12);
-        if (len >= 36) { ev.pos_x = *(float*)(data + 16); ev.pos_y = *(float*)(data + 20); }
-        if (len >= 44) { ev.pos2_x = *(float*)(data + 24); ev.pos2_y = *(float*)(data + 28); }
-        if (len >= 32) ev.flags = *(int*)(data + 32);
-        debugLog("[PACKET OUT RAW] type=" + std::to_string(pktType));
+        if (len >= 16) ev.netid = *(int*)(data + 8);
+        if (len >= 20) ev.item = *(int*)(data + 12);
+        if (len >= 28) { ev.pos_x = *(float*)(data + 16); ev.pos_y = *(float*)(data + 20); }
+        debugLog("[PKT OUT RAW] type=" + std::to_string(pktType));
         pushEvent(ev);
     }
 }
@@ -433,7 +447,12 @@ BOOL WINAPI hk_wglSwapBuffers(HDC hdc) {
         ImGui::EndChild();
 
         if (showSettings) {
-            ImGui::BeginChild("Settings", ImVec2(0, 75), true);
+            ImGui::BeginChild("Settings", ImVec2(0, 95), true);
+            ImGui::Text("Tick Interval: %.1fs", g_TickInterval);
+            ImGui::SameLine();
+            if (ImGui::SliderFloat("##tick", &g_TickInterval, 0.1f, 5.0f, "%.1fs")) {
+                if (g_executor) g_executor->setTickInterval(g_TickInterval);
+            }
             ImGui::Text("Debug Filters");
             ImGui::Columns(3, nullptr, false);
             ImGui::Checkbox("Packets", &debugPackets);
@@ -495,6 +514,22 @@ BOOL WINAPI hk_wglSwapBuffers(HDC hdc) {
 
     ImGui::Render();
     ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+    // Tick executor from render thread
+    if (g_executor && g_executor->isRunning()) {
+        static float lastTick = 0;
+        float dt = g_currentTime - lastTick;
+        if (dt >= g_TickInterval) {
+            lastTick = g_currentTime;
+            g_executor->tick(dt);
+        }
+    }
+
+    // Retry socket hooks if not installed yet
+    if (!g_SocketHooksInstalled) {
+        static int retryCount = 0;
+        if (++retryCount % 60 == 0) TryInstallSocketHooks();
+    }
 
     return o_wglSwapBuffers(hdc);
 }

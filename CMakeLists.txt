@@ -91,6 +91,7 @@ add_library(coems_executor SHARED
     src/dllmain.cpp
     src/lua_api.cpp
     src/hook.cpp
+    src/scanner.cpp
 )
 target_include_directories(coems_executor PRIVATE src)
 target_link_libraries(coems_executor PRIVATE imgui lua minhook opengl32 ws2_32 winhttp)
