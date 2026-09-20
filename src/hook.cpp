@@ -24,22 +24,8 @@ HWND g_GameHWND = nullptr;
 bool g_MenuOpen = false;
 WNDPROC oWndProc = nullptr;
 
-// ── Keyboard hook (F1 only) ──────────────────────────────────────────
-static HHOOK g_KeyHook = nullptr;
-
-static LRESULT CALLBACK KeyHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode >= 0) {
-        KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lParam;
-        int vk = kb->vkCode;
-        bool isDown = (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN);
-        static bool f1Was = false;
-        if (vk == VK_F1 && isDown && !f1Was) {
-            g_MenuOpen = !g_MenuOpen;
-        }
-        f1Was = isDown;
-    }
-    return CallNextHookEx(nullptr, nCode, wParam, lParam);
-}
+// ── F1 toggle via GetAsyncKeyState (no global hook — avoids Themida detection) ──
+static bool g_F1WasDown = false;
 
 // ── Clipboard ────────────────────────────────────────────────────────
 static const char* ClipGetText(void*) {
@@ -167,6 +153,8 @@ void GameState::parseTextPacket(const std::string& text, bool incoming) {
             p.size_x = safeFloat(kv.count("sizeX") ? kv["sizeX"] : "0");
             p.size_y = safeFloat(kv.count("sizeY") ? kv["sizeY"] : "0");
             p.world = kv.count("world") ? kv["world"] : "";
+            p.flags = safeInt(kv.count("flags") ? kv["flags"] : "0");
+            p.flags2 = safeInt(kv.count("flags2") ? kv["flags2"] : "0");
 
             debugLog("[SPAWN] name=" + p.name + " world=" + p.world +
                 " netid=" + std::to_string(p.netid));
@@ -180,6 +168,19 @@ void GameState::parseTextPacket(const std::string& text, bool incoming) {
                 }
             }
             if (!found) players.push_back(p);
+
+            // The first spawn we receive (localPlayer.netid == -1) is always
+            // the local player — populate localPlayer so GetLocal works.
+            if (localPlayer.netid == -1 && p.netid >= 0) {
+                localPlayer = p;
+                debugLog("[SPAWN] Set localPlayer: name=" + p.name +
+                    " netid=" + std::to_string(p.netid));
+            }
+            // If we already have a localPlayer and this spawn matches its netid,
+            // update it too (respawn, teleport, etc.)
+            else if (p.netid == localPlayer.netid) {
+                localPlayer = p;
+            }
         }
         return;
     }
@@ -202,17 +203,24 @@ void GameState::parseTextPacket(const std::string& text, bool incoming) {
     }
 
     if (action == "set_field_init" || action == "set_field_update") {
-        debugLog("[FIELD] type=" + (kv.count("type") ? kv["type"] : "?") +
-            " value=" + (kv.count("value") ? kv["value"] : "?"));
+        std::string fieldType = kv.count("type") ? kv["type"] : "?";
+        std::string fieldValue = kv.count("value") ? kv["value"] : "?";
+        debugLog("[FIELD] type=" + fieldType + " value=" + fieldValue);
         std::lock_guard<std::mutex> lock(mtx);
         if (kv.count("type")) {
-            std::string fieldType = kv["type"];
-            if (fieldType == "gems" && kv.count("value")) {
-                localPlayer.gems = safeInt(kv["value"]);
-            }
-            if (fieldType == "world" && kv.count("value")) {
-                localPlayer.world = kv["value"];
-            }
+            std::string ft = kv["type"];
+            if (ft == "gems" && kv.count("value")) localPlayer.gems = safeInt(kv["value"]);
+            else if (ft == "world" && kv.count("value")) localPlayer.world = kv["value"];
+            else if (ft == "name" && kv.count("value")) localPlayer.name = kv["value"];
+            else if (ft == "country" && kv.count("value")) localPlayer.country = kv["value"];
+            else if (ft == "x" && kv.count("value")) localPlayer.pos_x = safeFloat(kv["value"]);
+            else if (ft == "y" && kv.count("value")) localPlayer.pos_y = safeFloat(kv["value"]);
+            else if (ft == "modx" && kv.count("value")) localPlayer.pos_x = safeFloat(kv["value"]);
+            else if (ft == "mody" && kv.count("value")) localPlayer.pos_y = safeFloat(kv["value"]);
+            else if (ft == "sizeX" && kv.count("value")) localPlayer.size_x = safeFloat(kv["value"]);
+            else if (ft == "sizeY" && kv.count("value")) localPlayer.size_y = safeFloat(kv["value"]);
+            else if (ft == "tileX" && kv.count("value")) localPlayer.tile_x = safeInt(kv["value"]);
+            else if (ft == "tileY" && kv.count("value")) localPlayer.tile_y = safeInt(kv["value"]);
         }
         if (kv.count("world_name")) localPlayer.world = kv["world_name"];
         if (kv.count("width")) world_size_x = safeInt(kv["width"]);
@@ -373,11 +381,20 @@ BOOL WINAPI hk_wglSwapBuffers(HDC hdc) {
         ImGui_ImplWin32_Init(g_GameHWND);
         ImGui_ImplOpenGL3_Init("#version 330");
 
-        g_KeyHook = SetWindowsHookExW(WH_KEYBOARD_LL, KeyHookProc, GetModuleHandleW(nullptr), 0);
-
         g_executor = new LuaExecutor();
         g_Initialized = true;
         consoleLog("[INFO] Coems Executor initialized inside Growtopia");
+    }
+
+    // Poll F1 via GetAsyncKeyState instead of global keyboard hook.
+    // SetWindowsHookExW(WH_KEYBOARD_LL) is detected by Themida/VMProtect
+    // and causes ACCESS_VIOLATION when the user presses any key.
+    {
+        bool f1Down = (GetAsyncKeyState(VK_F1) & 0x8000) != 0;
+        if (f1Down && !g_F1WasDown) {
+            g_MenuOpen = !g_MenuOpen;
+        }
+        g_F1WasDown = f1Down;
     }
 
     ImGui_ImplOpenGL3_NewFrame();
@@ -523,12 +540,6 @@ BOOL WINAPI hk_wglSwapBuffers(HDC hdc) {
             lastTick = g_currentTime;
             g_executor->tick(dt);
         }
-    }
-
-    // Retry socket hooks if not installed yet
-    if (!g_SocketHooksInstalled) {
-        static int retryCount = 0;
-        if (++retryCount % 60 == 0) TryInstallSocketHooks();
     }
 
     return o_wglSwapBuffers(hdc);

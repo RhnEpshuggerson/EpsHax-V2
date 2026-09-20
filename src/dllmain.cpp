@@ -4,158 +4,371 @@
 #include "lua_api.h"
 #include "hook.h"
 #include "scanner.h"
+#include "native_hook.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <string>
+#include <vector>
 #include <mutex>
 #include <MinHook.h>
 #include <intrin.h>
 #include <dbghelp.h>
 #pragma comment(lib, "dbghelp.lib")
 
+// Set to 1 to enable native hook (code patching). DISABLED by default because
+// Themida/VMProtect anti-tamper in Growtopia detects E9 JMP patches at game
+// code addresses and crashes the process (ACCESS_VIOLATION at 0xD17DFFF5).
+// The BCrypt/TLS/socket hooks already capture all packet data without patching
+// game code, so the native hook is not needed for normal operation.
+#define ENABLE_NATIVE_HOOK 0
+
 float g_currentTime = 0;
+
+// When true, suppress VEH crash logging (scanners hit unmapped memory intentionally)
+volatile LONG g_ScanningActive = 0;
+
+// ── Heap scanner for decrypted packet data ─────────────────────────
+static bool g_HeapScanEnabled = true;
+static int g_HeapScanHits = 0;
+static uintptr_t g_LastScanRegion = 0;
+
+static bool IsHeapReadable(uintptr_t addr, size_t len) {
+    MEMORY_BASIC_INFORMATION mbi = {};
+    if (!VirtualQuery((void*)addr, &mbi, sizeof(mbi))) return false;
+    if (mbi.State != MEM_COMMIT) return false;
+    if (len > mbi.RegionSize) return false;
+    DWORD bad = PAGE_NOACCESS | PAGE_GUARD | PAGE_EXECUTE | PAGE_EXECUTE_READ;
+    return (mbi.Protect & bad) == 0 && (mbi.Protect != 0);
+}
+
+static bool IsAsciiPrintable(unsigned char c) {
+    return (c >= 0x20 && c <= 0x7E) || c == '\n' || c == '\r' || c == '\t';
+}
+
+static bool SafeMemCmp(const BYTE* a, const BYTE* b, size_t len) {
+    __try {
+        return memcmp(a, b, len) == 0;
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static int SafeAsciiLen(const BYTE* base, size_t maxSize) {
+    int len = 0;
+    __try {
+        while (len < 512 && (size_t)len < maxSize) {
+            unsigned char c = base[len];
+            if (c == 0) break;
+            if (!IsAsciiPrintable(c) && c != '\n' && c != '\r') return 0;
+            len++;
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+    return len;
+}
+
+// Extract a single packet from memory: reads until double newline or null
+extern "C" {
+    static const BYTE* s_extractBase = nullptr;
+    static size_t s_extractMax = 0;
+    static char s_extractBuf[512];
+    static int s_extractLen = 0;
+
+    static void __cdecl DoExtractPacket() {
+        s_extractLen = 0;
+        size_t maxLen = (s_extractMax < 512) ? s_extractMax : 512;
+        size_t i = 0;
+        int newlines = 0;
+        while (i < maxLen) {
+            unsigned char c = s_extractBase[i];
+            if (c == 0) break;
+            if (c == '\n') {
+                newlines++;
+                if (newlines >= 2) break;
+            } else {
+                newlines = 0;
+            }
+            if (!IsAsciiPrintable(c) && c != '\n' && c != '\r') break;
+            s_extractBuf[s_extractLen++] = (char)c;
+            i++;
+        }
+        s_extractBuf[s_extractLen] = '\0';
+    }
+
+    static int __cdecl TryExtractPacket(const BYTE* base, size_t maxSize) {
+        s_extractBase = base;
+        s_extractMax = maxSize;
+        s_extractLen = 0;
+        s_extractBuf[0] = '\0';
+        __try {
+            DoExtractPacket();
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            s_extractLen = 0;
+            s_extractBuf[0] = '\0';
+        }
+        return s_extractLen;
+    }
+}
+
+static std::string SafeExtractPacket(const BYTE* base, size_t maxSize) {
+    int len = TryExtractPacket(base, maxSize);
+    return std::string(s_extractBuf, len);
+}
+
+void ScanHeapForPackets() {
+    if (!g_HeapScanEnabled) return;
+
+    InterlockedExchange(&g_ScanningActive, 1);
+
+    const char* markers[] = {
+        "action|spawn",
+        "action|on_spawn",
+        "on_varlist",
+        "set_field_init",
+        "set_field_update",
+        "on_requestWorldSelectMenu",
+        "on_chat_message",
+        "on_killed",
+        "on_disconnect",
+        "play_sfx",
+    };
+    const int markerCount = sizeof(markers) / sizeof(markers[0]);
+
+    static std::vector<std::string> recentPackets;
+
+    uintptr_t addr = 0;
+    MEMORY_BASIC_INFORMATION mbi = {};
+    int regionsScanned = 0;
+
+    while (addr < 0x7FFFFFFFFFFFFFFF && regionsScanned < 500) {
+        if (!VirtualQuery((void*)addr, &mbi, sizeof(mbi))) break;
+        if (mbi.State == MEM_COMMIT && mbi.RegionSize >= 64 && mbi.RegionSize < 0x8000000) {
+            DWORD prot = mbi.Protect;
+            // Skip executable regions — text packets are in heap (RW) memory
+            bool isExec = (prot & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+            bool noAccess = (prot & (PAGE_NOACCESS | PAGE_GUARD)) != 0;
+            bool isReadable = (prot & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+
+            if (isReadable && !isExec && !noAccess) {
+                BYTE* base = (BYTE*)mbi.BaseAddress;
+                size_t size = mbi.RegionSize;
+
+                for (int m = 0; m < markerCount; m++) {
+                    size_t markerLen = strlen(markers[m]);
+                    if (markerLen + 20 >= size) continue;
+
+                    for (size_t i = 0; i + markerLen + 10 < size; i++) {
+                        if (!SafeMemCmp(base + i, (const BYTE*)markers[m], markerLen)) continue;
+
+                        std::string text = SafeExtractPacket(base + i, size - i);
+                        if (text.size() > markerLen + 5) {
+                            size_t firstLineEnd = text.find('\n');
+                            if (firstLineEnd != std::string::npos && firstLineEnd > 2) {
+                                std::string firstLine = text.substr(0, firstLineEnd);
+                                size_t pipe = firstLine.find('|');
+                                if (pipe != std::string::npos) {
+                                    std::string key = firstLine.substr(0, pipe);
+                                    bool valid = true; // Found by specific marker, accept it
+                                    if (valid) {
+                                        std::string preview = text.substr(0, 80);
+                                        bool dup = false;
+                                        for (auto& r : recentPackets) { if (r == preview) { dup = true; break; } }
+                                        if (!dup) {
+                                            recentPackets.push_back(preview);
+                                            if (recentPackets.size() > 100) recentPackets.erase(recentPackets.begin());
+                                            g_HeapScanHits++;
+                                            GameState::instance().parseTextPacket(text, true);
+                                            consoleLog("[HEAPSCAN #" + std::to_string(g_HeapScanHits) + "] " + text.substr(0, 120));
+                                        }
+                                    }
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            regionsScanned++;
+        }
+        addr = (uintptr_t)mbi.BaseAddress + mbi.RegionSize;
+        if (addr <= (uintptr_t)mbi.BaseAddress) break;
+    }
+
+    InterlockedExchange(&g_ScanningActive, 0);
+}
+
+// Pure-C crash writer (no C++ objects in scope so __try works)
+// Called from VehHandler with copied context so nested exceptions are safe
+static void WriteCrashLog(DWORD excCode, void* excAddr, DWORD_PTR accessType, DWORD_PTR accessAddr, CONTEXT* ctx) {
+    const char* dir = "C:\\Users\\LENOVO\\Documents\\groetopia\\cv dl script\\coems_executor\\package-scanner-output\\Crash log";
+    CreateDirectoryA(dir, nullptr);
+
+    char path[MAX_PATH];
+    int idx = 0;
+    for (;;) {
+        if (idx == 0)
+            snprintf(path, sizeof(path), "%s\\crash.txt", dir);
+        else
+            snprintf(path, sizeof(path), "%s\\crash%d.txt", dir, idx);
+        WIN32_FIND_DATAA fd;
+        HANDLE hFind = FindFirstFileA(path, &fd);
+        if (hFind == INVALID_HANDLE_VALUE) break;
+        FindClose(hFind);
+        idx++;
+    }
+
+    HANDLE hFile = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+
+    DWORD written;
+    char buf[512];
+
+    const char* excName = "UNKNOWN";
+    if (excCode == EXCEPTION_ACCESS_VIOLATION) excName = "ACCESS_VIOLATION";
+    else if (excCode == EXCEPTION_STACK_OVERFLOW) excName = "STACK_OVERFLOW";
+    else if (excCode == EXCEPTION_ILLEGAL_INSTRUCTION) excName = "ILLEGAL_INSTRUCTION";
+
+    int n = snprintf(buf, sizeof(buf),
+        "=== CRASH LOG ===\r\n"
+        "Exception: %s (0x%08X)\r\n"
+        "Address: 0x%p\r\n"
+        "Access type: %s\r\n"
+        "Access address: 0x%p\r\n\r\n"
+        "=== REGISTERS ===\r\n",
+        excName, excCode, excAddr,
+        accessType ? "WRITE" : "READ",
+        (void*)accessAddr);
+    WriteFile(hFile, buf, n, &written, nullptr);
+
+#ifdef _WIN64
+    n = snprintf(buf, sizeof(buf),
+        "RAX=0x%016llX  RBX=0x%016llX\r\n"
+        "RCX=0x%016llX  RDX=0x%016llX\r\n"
+        "RSI=0x%016llX  RDI=0x%016llX\r\n"
+        "RSP=0x%016llX  RBP=0x%016llX\r\n"
+        "R8 =0x%016llX  R9 =0x%016llX\r\n"
+        "R10=0x%016llX  R11=0x%016llX\r\n"
+        "R12=0x%016llX  R13=0x%016llX\r\n"
+        "R14=0x%016llX  R15=0x%016llX\r\n"
+        "RIP=0x%016llX  EFLAGS=0x%08X\r\n\r\n",
+        ctx->Rax, ctx->Rbx, ctx->Rcx, ctx->Rdx,
+        ctx->Rsi, ctx->Rdi, ctx->Rsp, ctx->Rbp,
+        ctx->R8, ctx->R9, ctx->R10, ctx->R11,
+        ctx->R12, ctx->R13, ctx->R14, ctx->R15,
+        ctx->Rip, ctx->EFlags);
+    WriteFile(hFile, buf, n, &written, nullptr);
+
+    // Dump bytes around faulting instruction — wrapped in __try because the
+    // address may be completely unmapped (anti-tamper redirect, etc.)
+    {
+        BYTE* rip = (BYTE*)ctx->Rip;
+        n = snprintf(buf, sizeof(buf), "=== CODE AROUND RIP ===\r\n");
+        WriteFile(hFile, buf, n, &written, nullptr);
+        for (int i = -16; i < 32; i++) {
+            BYTE* p = rip + i;
+            BYTE val = 0;
+            __try {
+                val = *p;
+                n = (i == 0)
+                    ? snprintf(buf, sizeof(buf), ">>> %02X ", val)
+                    : snprintf(buf, sizeof(buf), "    %02X ", val);
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                n = snprintf(buf, sizeof(buf), "    ?? ");
+            }
+            WriteFile(hFile, buf, n, &written, nullptr);
+            if ((i + 1) % 8 == 0) WriteFile(hFile, "\r\n", 2, &written, nullptr);
+        }
+    }
+#else
+    n = snprintf(buf, sizeof(buf),
+        "EAX=0x%08X  EBX=0x%08X\r\n"
+        "ECX=0x%08X  EDX=0x%08X\r\n"
+        "ESI=0x%08X  EDI=0x%08X\r\n"
+        "ESP=0x%08X  EBP=0x%08X\r\n"
+        "EIP=0x%08X  EFLAGS=0x%08X\r\n\r\n",
+        ctx->Eax, ctx->Ebx, ctx->Ecx, ctx->Edx,
+        ctx->Esi, ctx->Edi, ctx->Esp, ctx->Ebp,
+        ctx->Eip, ctx->EFlags);
+    WriteFile(hFile, buf, n, &written, nullptr);
+#endif
+
+    // Dump stack
+    n = snprintf(buf, sizeof(buf), "\r\n=== STACK (64 bytes) ===\r\n");
+    WriteFile(hFile, buf, n, &written, nullptr);
+#ifdef _WIN64
+    uintptr_t* sp = (uintptr_t*)ctx->Rsp;
+#else
+    uintptr_t* sp = (uintptr_t*)ctx->Esp;
+#endif
+    for (int i = 0; i < 8; i++) {
+        uintptr_t val = 0;
+        __try {
+            val = sp[i];
+            n = snprintf(buf, sizeof(buf), "  [RSP+0x%02X] 0x%p\r\n", i * 8, (void*)val);
+        } __except(EXCEPTION_EXECUTE_HANDLER) {
+            n = snprintf(buf, sizeof(buf), "  [RSP+0x%02X] <unreadable>\r\n", i * 8);
+        }
+        WriteFile(hFile, buf, n, &written, nullptr);
+    }
+
+    // Dump game function addresses
+    n = snprintf(buf, sizeof(buf),
+        "\r\n=== RESOLVED ADDRESSES ===\r\n"
+        "ProcessTankUpdatePacket = 0x%p\r\n"
+        "SendPacket = 0x%p\r\n"
+        "GetGameLogic = 0x%p\r\n",
+        (void*)scanner::fn_ProcessTankUpdatePacket,
+        (void*)scanner::fn_SendPacket,
+        (void*)scanner::fn_GetGameLogic);
+    WriteFile(hFile, buf, n, &written, nullptr);
+
+    FlushFileBuffers(hFile);
+    CloseHandle(hFile);
+}
 
 static LONG WINAPI VehHandler(EXCEPTION_POINTERS* ep) {
     if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
         ep->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW ||
         ep->ExceptionRecord->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) {
 
-        const char* dir = "C:\\Users\\LENOVO\\Documents\\groetopia\\cv dl script\\coems_executor\\package-scanner-output";
-
-        // Find next available crash log file
-        char path[MAX_PATH];
-        int idx = 0;
-        for (;;) {
-            if (idx == 0)
-                snprintf(path, sizeof(path), "%s\\crash.txt", dir);
-            else
-                snprintf(path, sizeof(path), "%s\\crash%d.txt", dir, idx);
-            WIN32_FIND_DATAA fd;
-            HANDLE hFind = FindFirstFileA(path, &fd);
-            if (hFind == INVALID_HANDLE_VALUE) break;
-            FindClose(hFind);
-            idx++;
+        // Suppress crash logs during memory scans — scanners intentionally hit unmapped memory
+        if (InterlockedCompareExchange(&g_ScanningActive, 0, 0) != 0) {
+            return EXCEPTION_CONTINUE_SEARCH;
         }
 
-        HANDLE hFile = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hFile != INVALID_HANDLE_VALUE) {
-            DWORD written;
-            char buf[512];
+        // Rate-limit crash logs to at most 1 per 5 seconds
+        static DWORD lastCrashLogTime = 0;
+        DWORD now = GetTickCount();
+        if (now - lastCrashLogTime < 5000) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        lastCrashLogTime = now;
 
-            const char* excName = "UNKNOWN";
-            if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) excName = "ACCESS_VIOLATION";
-            else if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) excName = "STACK_OVERFLOW";
-            else if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ILLEGAL_INSTRUCTION) excName = "ILLEGAL_INSTRUCTION";
-
-            int n = snprintf(buf, sizeof(buf),
-                "=== CRASH LOG ===\r\n"
-                "Exception: %s (0x%08X)\r\n"
-                "Address: 0x%p\r\n"
-                "Access type: %s\r\n"
-                "Access address: 0x%p\r\n\r\n"
-                "=== REGISTERS ===\r\n",
-                excName, ep->ExceptionRecord->ExceptionCode,
-                ep->ExceptionRecord->ExceptionAddress,
-                ep->ExceptionRecord->ExceptionInformation[0] ? "WRITE" : "READ",
-                (void*)ep->ExceptionRecord->ExceptionInformation[1]);
-            WriteFile(hFile, buf, n, &written, nullptr);
-
-#ifdef _WIN64
-            CONTEXT* ctx = ep->ContextRecord;
-            n = snprintf(buf, sizeof(buf),
-                "RAX=0x%016llX  RBX=0x%016llX\r\n"
-                "RCX=0x%016llX  RDX=0x%016llX\r\n"
-                "RSI=0x%016llX  RDI=0x%016llX\r\n"
-                "RSP=0x%016llX  RBP=0x%016llX\r\n"
-                "R8 =0x%016llX  R9 =0x%016llX\r\n"
-                "R10=0x%016llX  R11=0x%016llX\r\n"
-                "R12=0x%016llX  R13=0x%016llX\r\n"
-                "R14=0x%016llX  R15=0x%016llX\r\n"
-                "RIP=0x%016llX  EFLAGS=0x%08X\r\n\r\n",
-                ctx->Rax, ctx->Rbx, ctx->Rcx, ctx->Rdx,
-                ctx->Rsi, ctx->Rdi, ctx->Rsp, ctx->Rbp,
-                ctx->R8, ctx->R9, ctx->R10, ctx->R11,
-                ctx->R12, ctx->R13, ctx->R14, ctx->R15,
-                ctx->Rip, ctx->EFlags);
-            WriteFile(hFile, buf, n, &written, nullptr);
-
-            // Dump bytes around faulting instruction
-            BYTE* rip = (BYTE*)ctx->Rip;
-            n = snprintf(buf, sizeof(buf), "=== CODE AROUND RIP ===\r\n");
-            WriteFile(hFile, buf, n, &written, nullptr);
-            for (int i = -16; i < 32; i++) {
-                BYTE* p = rip + i;
-                if (i == 0) n = snprintf(buf, sizeof(buf), ">>> %02X ", *p);
-                else n = snprintf(buf, sizeof(buf), "    %02X ", *p);
-                WriteFile(hFile, buf, n, &written, nullptr);
-                if ((i + 1) % 8 == 0) WriteFile(hFile, "\r\n", 2, &written, nullptr);
-            }
-#else
-            CONTEXT* ctx = ep->ContextRecord;
-            n = snprintf(buf, sizeof(buf),
-                "EAX=0x%08X  EBX=0x%08X\r\n"
-                "ECX=0x%08X  EDX=0x%08X\r\n"
-                "ESI=0x%08X  EDI=0x%08X\r\n"
-                "ESP=0x%08X  EBP=0x%08X\r\n"
-                "EIP=0x%08X  EFLAGS=0x%08X\r\n\r\n",
-                ctx->Eax, ctx->Ebx, ctx->Ecx, ctx->Edx,
-                ctx->Esi, ctx->Edi, ctx->Esp, ctx->Ebp,
-                ctx->Eip, ctx->EFlags);
-            WriteFile(hFile, buf, n, &written, nullptr);
-#endif
-
-            // Dump stack
-            n = snprintf(buf, sizeof(buf), "\r\n=== STACK (64 bytes) ===\r\n");
-            WriteFile(hFile, buf, n, &written, nullptr);
-#ifdef _WIN64
-            uintptr_t* sp = (uintptr_t*)ctx->Rsp;
-#else
-            uintptr_t* sp = (uintptr_t*)ctx->Esp;
-#endif
-            for (int i = 0; i < 8; i++) {
-                MEMORY_BASIC_INFORMATION mbi;
-                bool readable = VirtualQuery(sp + i, &mbi, sizeof(mbi)) &&
-                    mbi.State == MEM_COMMIT &&
-                    (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY));
-                if (readable)
-                    n = snprintf(buf, sizeof(buf), "  [RSP+0x%02X] 0x%p\r\n", i * 8, (void*)sp[i]);
-                else
-                    n = snprintf(buf, sizeof(buf), "  [RSP+0x%02X] <unreadable>\r\n", i * 8);
-                WriteFile(hFile, buf, n, &written, nullptr);
-            }
-
-            // Dump game function addresses
-            n = snprintf(buf, sizeof(buf),
-                "\r\n=== RESOLVED ADDRESSES ===\r\n"
-                "ProcessTankUpdatePacket = 0x%p\r\n"
-                "SendPacket = 0x%p\r\n"
-                "GetGameLogic = 0x%p\r\n\r\n"
-                "=== DEBUG LOG (last 30) ===\r\n",
-                (void*)scanner::fn_ProcessTankUpdatePacket,
-                (void*)scanner::fn_SendPacket,
-                (void*)scanner::fn_GetGameLogic);
-            WriteFile(hFile, buf, n, &written, nullptr);
-
-            {
-                std::lock_guard<std::mutex> lock(g_debugMutex);
-                int start = (int)g_debugLogs.size() - 30;
-                if (start < 0) start = 0;
-                for (int i = start; i < (int)g_debugLogs.size(); i++) {
-                    n = snprintf(buf, sizeof(buf), "%s\r\n", g_debugLogs[i].message.c_str());
-                    WriteFile(hFile, buf, n, &written, nullptr);
-                }
-            }
-
-            // Also write to debug log
-            debugLog("[CRASH] " + std::string(excName) + " at 0x" +
-                std::to_string((uintptr_t)ep->ExceptionRecord->ExceptionAddress) +
-                " -> saved to " + path);
-
-            FlushFileBuffers(hFile);
-            CloseHandle(hFile);
+        // Prevent nested VEH calls (our handler crashing triggers another exception)
+        static LONG g_inVeh = 0;
+        if (InterlockedCompareExchange(&g_inVeh, 1, 0) != 0) {
+            return EXCEPTION_CONTINUE_SEARCH;
         }
 
+        // Extract exception info and copy context before calling C function
+        DWORD excCode = ep->ExceptionRecord->ExceptionCode;
+        void* excAddr = ep->ExceptionRecord->ExceptionAddress;
+        DWORD_PTR accessType = ep->ExceptionRecord->ExceptionInformation[0];
+        DWORD_PTR accessAddr = ep->ExceptionRecord->ExceptionInformation[1];
+        CONTEXT ctxCopy = {};
+#ifdef _WIN64
+        memcpy(&ctxCopy, ep->ContextRecord, sizeof(CONTEXT));
+#else
+        memcpy(&ctxCopy, ep->ContextRecord, sizeof(CONTEXT));
+#endif
+
+        WriteCrashLog(excCode, excAddr, accessType, accessAddr, &ctxCopy);
+
+        InterlockedExchange(&g_inVeh, 0);
         return EXCEPTION_CONTINUE_SEARCH;
     }
     return EXCEPTION_CONTINUE_SEARCH;
@@ -218,8 +431,12 @@ static int g_TlsAppDataCount = 0;
 
 int WINAPI hk_recv(SOCKET s, char* buf, int len, int flags) {
     int result = o_recv(s, buf, len, flags);
-    if (result > 4 && buf) {
-        GameState::instance().parseIncoming(buf, result);
+
+    if (result > 0 && buf) {
+        static int heapScanCounter = 0;
+        if (++heapScanCounter % 10 == 0) {
+            ScanHeapForPackets();
+        }
     }
     g_RecvCount++;
     if (result >= 5 && buf) {
@@ -446,11 +663,171 @@ void TryInstallSocketHooks() {
     if (hWS2) {
         InstallSocketHooks(hWS2);
         g_SocketHooksInstalled = true;
-        consoleLog("[INFO] All socket hooks installed");
+        consoleLog("[INFO] All system DLL hooks DISABLED (Themida detects MinHook patches on bcrypt/ws2_32)");
+    consoleLog("[INFO] Using only wglSwapBuffers hook + heap scanner for data");
+    }
+}
+
+// ── BCrypt decrypt hook ────────────────────────────────────────────
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
+
+typedef NTSTATUS (WINAPI* BCryptDecrypt_t)(
+    BCRYPT_KEY_HANDLE hKey, PUCHAR pbInput, ULONG cbInput,
+    void* pPaddingInfo, PUCHAR pbIV, ULONG cbIV,
+    PUCHAR pbOutput, ULONG cbOutput, ULONG* pcbResult, ULONG dwFlags);
+
+static BCryptDecrypt_t o_BCryptDecrypt = nullptr;
+static int g_BCryptCount = 0;
+
+NTSTATUS WINAPI hk_BCryptDecrypt(
+    BCRYPT_KEY_HANDLE hKey, PUCHAR pbInput, ULONG cbInput,
+    void* pPaddingInfo, PUCHAR pbIV, ULONG cbIV,
+    PUCHAR pbOutput, ULONG cbOutput, ULONG* pcbResult, ULONG dwFlags)
+{
+    NTSTATUS status = o_BCryptDecrypt(hKey, pbInput, cbInput, pPaddingInfo,
+        pbIV, cbIV, pbOutput, cbOutput, pcbResult, dwFlags);
+
+    if (status >= 0 && pbOutput && cbOutput >= 4) {
+        g_BCryptCount++;
+        if (g_BCryptCount <= 20) {
+            char hex[256] = {};
+            int pos = 0;
+            for (UINT i = 0; i < 64 && i < cbOutput && pos < 240; i++) {
+                pos += snprintf(hex + pos, 240 - pos, "%02X ", pbOutput[i]);
+                if ((i + 1) % 32 == 0) pos += snprintf(hex + pos, 240 - pos, "\n    ");
+            }
+            char msg[512];
+            snprintf(msg, sizeof(msg), "[BCRYPT #%d] outLen=%d pcbResult=%d\n    %s",
+                g_BCryptCount, cbOutput, pcbResult ? (int)*pcbResult : -1, hex);
+            consoleLog(msg);
+
+            uint32_t header = *(uint32_t*)pbOutput;
+            int pktType = header & 0xFF;
+
+            if (pktType == 4 && cbOutput > 4) {
+                std::string text((char*)(pbOutput + 4), cbOutput - 4);
+                if (text.size() > 2) {
+                    GameState::instance().parseTextPacket(text, true);
+                    consoleLog("[BCRYPT] Parsed type=4 text packet, len=" + std::to_string(text.size()));
+                }
+            }
+
+            if ((pktType == 1 || pktType == 2 || pktType == 3) && cbOutput >= 16) {
+                GameState::instance().parseIncoming((const char*)pbOutput, cbOutput);
+                consoleLog("[BCRYPT] Parsed type=" + std::to_string(pktType) + " raw packet");
+            }
+        }
+    }
+
+    return status;
+}
+
+void TryInstallBCryptHooks() {
+    const char* dlls[] = { "bcrypt.dll", "bcryptprimitives.dll" };
+    for (const char* dll : dlls) {
+        HMODULE h = GetModuleHandleA(dll);
+        if (!h) h = LoadLibraryA(dll);
+        if (!h) continue;
+
+        auto addr = (void*)GetProcAddress(h, "BCryptDecrypt");
+        if (addr && !o_BCryptDecrypt) {
+            MH_STATUS st = MH_CreateHook(addr, (void*)hk_BCryptDecrypt, (void**)&o_BCryptDecrypt);
+            if (st == MH_OK) {
+                MH_EnableHook(addr);
+                consoleLog("[INFO] BCryptDecrypt hooked in " + std::string(dll));
+            } else {
+                char buf[128];
+                snprintf(buf, sizeof(buf), "[WARN] BCryptDecrypt hook failed: %d", (int)st);
+                consoleLog(buf);
+            }
+        }
+    }
+    if (!o_BCryptDecrypt) {
+        consoleLog("[INFO] BCryptDecrypt not found - game may use own crypto");
     }
 }
 
 // ── Main thread ──────────────────────────────────────────────────────
+
+#if ENABLE_NATIVE_HOOK
+// Native hook: packet dispatcher at 0x1417E89CB
+// This function receives decrypted packets after TLS processing
+// EAX = packet type, RCX = data pointer (varies by type)
+static int g_NativeHookHits = 0;
+
+extern "C" void hk_PacketDispatcher(SavedRegs* regs) {
+    g_NativeHookHits++;
+
+    char buf[512];
+
+    if (g_NativeHookHits <= 200) {
+        snprintf(buf, sizeof(buf),
+            "[NATIVEHOOK #%d] RAX=0x%llX RCX=0x%llX RDX=0x%llX R8=0x%llX R9=0x%llX R10=0x%llX R11=0x%llX",
+            g_NativeHookHits,
+            (unsigned long long)regs->rax, (unsigned long long)regs->rcx,
+            (unsigned long long)regs->rdx, (unsigned long long)regs->r8,
+            (unsigned long long)regs->r9, (unsigned long long)regs->r10,
+            (unsigned long long)regs->r11);
+        consoleLog(buf);
+
+        uintptr_t dataPtr = regs->rcx;
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (dataPtr > 0x10000 && dataPtr < 0x7FFFFFFFFFFF && VirtualQuery((void*)dataPtr, &mbi, sizeof(mbi))) {
+            char hex[512] = {};
+            int pos = 0;
+            for (unsigned int i = 0; i < 64 && pos < 480; i++) {
+                unsigned char b = ((unsigned char*)dataPtr)[i];
+                pos += snprintf(hex + pos, 512 - pos, "%02X ", b);
+                if ((i + 1) % 32 == 0) pos += snprintf(hex + pos, 512 - pos, "\n    ");
+            }
+            snprintf(buf, sizeof(buf), "[NATIVEHOOK] RCX data: %s", hex);
+            consoleLog(buf);
+
+            uint32_t header = *(uint32_t*)dataPtr;
+            int pktType = header & 0xFF;
+            if (pktType == 4 && dataPtr > 0x10000) {
+                const char* text = (const char*)(dataPtr + 4);
+                bool valid = true;
+                for (size_t i = 0; i < 256 && text[i]; i++) {
+                    if ((unsigned char)text[i] < 0x20 && text[i] != '\n' && text[i] != '\r') { valid = false; break; }
+                }
+                if (valid && strlen(text) > 4) {
+                    std::string pktText(text, strnlen(text, 256));
+                    GameState::instance().parseTextPacket(pktText, true);
+                    consoleLog("[NATIVEHOOK] PARSED TEXT: " + pktText.substr(0, 200));
+                }
+            }
+        }
+    }
+}
+
+void TryInstallNativeHooks() {
+    native_hook::SetDispatchCallback(hk_PacketDispatcher);
+
+    uintptr_t targets[] = {
+        0x1417E89CB,
+        0x1417E8360,
+        0x1417C5CC1,
+        0x1417F1DB0,
+        0x1419EBD08,
+    };
+    char buf[256];
+
+    for (auto target : targets) {
+        snprintf(buf, sizeof(buf), "[NATIVEHOOK] Trying target 0x%p", (void*)target);
+        consoleLog(buf);
+
+        void* original = nullptr;
+        if (native_hook::Install((void*)target, (void*)hk_PacketDispatcher, &original)) {
+            snprintf(buf, sizeof(buf), "[NATIVEHOOK] SUCCESS - hooked at 0x%p", (void*)target);
+            consoleLog(buf);
+            return;
+        }
+    }
+    consoleLog("[NATIVEHOOK] All targets failed");
+}
+#endif // ENABLE_NATIVE_HOOK
 
 void MainThread(HMODULE hModule) {
     while (!GetModuleHandleA("opengl32.dll")) Sleep(100);
@@ -473,15 +850,38 @@ void MainThread(HMODULE hModule) {
         consoleLog("[INFO] wglSwapBuffers hook installed");
     }
 
-    TryInstallSocketHooks();
-    TryInstallTLSHooks();
+    // REMOVED: Themida/VMProtect detects MinHook patches on ws2_32/bcrypt and
+    // corrupts pointers causing ACCESS_VIOLATION at random addresses.
+    // Packet capture now relies on heap scanner only.
+    // TryInstallSocketHooks();
+    // TryInstallTLSHooks();
+    // TryInstallBCryptHooks();
+    consoleLog("[INFO] System DLL hooks DISABLED - using wglSwapBuffers + heap scanner only");
 
     HMODULE hGame = GetModuleHandleA(NULL);
     if (hGame) {
         scanner::Install(hGame);
     }
 
+#if ENABLE_NATIVE_HOOK
+    Sleep(1000);
+    TryInstallNativeHooks();
+#else
+    consoleLog("[INFO] Native hook DISABLED (ENABLE_NATIVE_HOOK=0) - packet capture via heap scanner");
+#endif
+
+    // Background scanner thread — scans heap every 500ms without blocking render
+    CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+        while (true) {
+            Sleep(500);
+            ScanHeapForPackets();
+        }
+        return 0;
+    }, nullptr, 0, nullptr);
+    consoleLog("[INFO] Background heap scanner started (500ms interval)");
+
     auto t0 = std::chrono::steady_clock::now();
+
     while (true) {
         Sleep(100);
         auto now = std::chrono::steady_clock::now();
