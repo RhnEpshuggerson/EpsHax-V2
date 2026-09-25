@@ -11,9 +11,9 @@
 #include <string>
 #include <vector>
 #include <mutex>
-#include <MinHook.h>
 #include <intrin.h>
 #include <dbghelp.h>
+#include "epshook.h"
 #pragma comment(lib, "dbghelp.lib")
 
 // Set to 1 to enable native hook (code patching). DISABLED by default because
@@ -557,12 +557,11 @@ SOCKET WINAPI hk_WSASocketW(int af, int type, int protocol, LPWSAPROTOCOL_INFOW 
 static void HookSocketFunction(HMODULE hWS2, const char* name, void* hook, void** original) {
     auto addr = (void*)GetProcAddress(hWS2, name);
     if (addr) {
-        MH_STATUS st = MH_CreateHook(addr, hook, original);
-        if (st == MH_OK) {
-            MH_EnableHook(addr);
+        epshook::Status st = epshook::Create(addr, hook, original);
+        if (st == epshook::OK) {
             debugLog("[HOOK] " + std::string(name) + " hooked OK");
         } else {
-            debugLog("[HOOK] " + std::string(name) + " hook FAILED: " + std::to_string(st));
+            debugLog("[HOOK] " + std::string(name) + " hook FAILED: " + epshook::StatusString(st));
         }
     } else {
         debugLog("[HOOK] " + std::string(name) + " not found in ws2_32");
@@ -645,13 +644,12 @@ void TryInstallTLSHooks() {
     auto addr = (void*)GetProcAddress(hSec, "DecryptMessage");
     if (!addr) addr = (void*)GetProcAddress(hSec, "SslDecryptPacket");
     if (addr) {
-        MH_STATUS st = MH_CreateHook(addr, (void*)hk_DecryptMessage, (void**)&o_DecryptMessage);
-        if (st == MH_OK) {
-            MH_EnableHook(addr);
+        epshook::Status st = epshook::Create(addr, (void*)hk_DecryptMessage, (void**)&o_DecryptMessage);
+        if (st == epshook::OK) {
             consoleLog("[INFO] TLS decrypt hook installed OK");
         } else {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "[WARN] TLS decrypt hook failed: %d", (int)st);
+            char buf[160];
+            snprintf(buf, sizeof(buf), "[WARN] TLS decrypt hook failed: %s", epshook::StatusString(st));
             consoleLog(buf);
         }
     } else {
@@ -737,13 +735,12 @@ void TryInstallBCryptHooks() {
 
         auto addr = (void*)GetProcAddress(h, "BCryptDecrypt");
         if (addr && !o_BCryptDecrypt) {
-            MH_STATUS st = MH_CreateHook(addr, (void*)hk_BCryptDecrypt, (void**)&o_BCryptDecrypt);
-            if (st == MH_OK) {
-                MH_EnableHook(addr);
+            epshook::Status st = epshook::Create(addr, (void*)hk_BCryptDecrypt, (void**)&o_BCryptDecrypt);
+            if (st == epshook::OK) {
                 consoleLog("[INFO] BCryptDecrypt hooked in " + std::string(dll));
             } else {
-                char buf[128];
-                snprintf(buf, sizeof(buf), "[WARN] BCryptDecrypt hook failed: %d", (int)st);
+                char buf[160];
+                snprintf(buf, sizeof(buf), "[WARN] BCryptDecrypt hook failed: %s", epshook::StatusString(st));
                 consoleLog(buf);
             }
         }
@@ -841,18 +838,18 @@ void MainThread(HMODULE hModule) {
     HMODULE hOGL = GetModuleHandleA("opengl32.dll");
     auto p_wglSwapBuffers = (void*)GetProcAddress(hOGL, "wglSwapBuffers");
 
-    if (MH_Initialize() != MH_OK) {
-        FreeLibraryAndExitThread(hModule, 1);
-        return;
-    }
-
     AddVectoredExceptionHandler(1, VehHandler);
     consoleLog("[INFO] VEH handler installed");
 
     if (p_wglSwapBuffers) {
-        MH_CreateHook(p_wglSwapBuffers, (void*)hk_wglSwapBuffers, (void**)&o_wglSwapBuffers);
-        MH_EnableHook(p_wglSwapBuffers);
-        consoleLog("[INFO] wglSwapBuffers hook installed");
+        epshook::Status st = epshook::Create(p_wglSwapBuffers, (void*)hk_wglSwapBuffers, (void**)&o_wglSwapBuffers);
+        if (st == epshook::OK) {
+            consoleLog("[INFO] wglSwapBuffers hook installed");
+        } else {
+            char buf[160];
+            snprintf(buf, sizeof(buf), "[WARN] wglSwapBuffers hook failed: %s", epshook::StatusString(st));
+            consoleLog(buf);
+        }
     }
 
     // System DLL hooks only when GrowPai is NOT loaded.
@@ -1122,8 +1119,7 @@ void MainThread(HMODULE hModule) {
         g_currentTime = std::chrono::duration<float>(now - t0).count();
     }
 
-    MH_DisableHook(MH_ALL_HOOKS);
-    MH_Uninitialize();
+    epshook::RemoveAll();
     FreeLibraryAndExitThread(hModule, 0);
 }
 

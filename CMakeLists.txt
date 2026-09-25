@@ -51,17 +51,7 @@ if(NOT lua_POPULATED)
     target_include_directories(lua PUBLIC ${lua_SOURCE_DIR}/src)
 endif()
 
-# ── MinHook (auto-download) ──────────────────────────────────────────
-FetchContent_Declare(
-    minhook
-    GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
-    GIT_TAG        master
-)
-FetchContent_GetProperties(minhook)
-if(NOT minhook_POPULATED)
-    FetchContent_Populate(minhook)
-    add_subdirectory(${minhook_SOURCE_DIR} ${minhook_BINARY_DIR})
-endif()
+# ── EpsHook (in-tree, see EpsHookV2 repo) ─────────────────────────────
 
 # ── ImGui (Win32 + OpenGL3 backend) ─────────────────────────────────
 set(IMGUI_DIR ${CMAKE_SOURCE_DIR}/libs/imgui)
@@ -94,9 +84,10 @@ add_library(EpsHax SHARED
     src/scanner.cpp
     src/native_hook.cpp
     src/lua_state_finder.cpp
+    src/epshook.cpp
 )
 target_include_directories(EpsHax PRIVATE src)
-target_link_libraries(EpsHax PRIVATE imgui lua minhook opengl32 ws2_32 winhttp)
+target_link_libraries(EpsHax PRIVATE imgui lua opengl32 ws2_32 winhttp)
 target_compile_definitions(EpsHax PRIVATE EPSHAX_EXPORTS)
 
 # ── Loader (injects EpsHax.dll into Growtopia) ────────────────────────
