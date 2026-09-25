@@ -398,15 +398,15 @@ static bool InjectOne(DWORD pid, const std::string& dllPath, const char* dllName
 int main(int argc, char** argv) {
     SetConsoleTitleA("EpsHax Loader");
     printf("============================\n");
-    printf("   EpsHax Loader v3 (multi)\n");
+    printf("   EpsHax Loader v4 (new instance per run)\n");
     printf("============================\n\n");
 
     // Parse args:
-    //   (none)          → inject all running; if none, launch 1
-    //   -n N            → launch N new instances (keep existing, inject all)
-    //   -n 0            → inject running only (do not launch)
+    //   (none)          → launch 1 NEW Growtopia, inject ONLY into it
+    //   -n N            → launch N new instances, inject ONLY into those
+    //   -n 0            → inject ALL running instances (no launch)
     //   <dllpath>       → drag-drop DLL
-    int launchCount = -1; // -1 = default behavior
+    int launchCount = 1; // default: always a fresh EpsHax-only instance
     std::string dllPath;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) {
@@ -425,7 +425,7 @@ int main(int argc, char** argv) {
     }
     if (GetFileAttributesA(dllPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
         Fail("DLL not found: %s", dllPath.c_str());
-        Log("Usage: EpsHaxLoader [-n instanceCount] [dllPath]");
+        Log("Usage: EpsHaxLoader [-n instanceCount] [dllPath]  (default: 1 new instance; -n 0 = inject all running)");
         system("pause");
         return 1;
     }
@@ -434,47 +434,37 @@ int main(int argc, char** argv) {
 
     EnableDebugPrivilege();
 
-    // Launch new instances
+    std::vector<DWORD> targets;
     if (launchCount > 0) {
-        Log("[*] Launching %d new Growtopia instance(s)...", launchCount);
-        std::vector<DWORD> fresh;
+        Log("[*] Launching %d new Growtopia instance(s) (EpsHax-only, keeps existing instances untouched)...", launchCount);
         for (int i = 0; i < launchCount; i++) {
             HANDLE hp = nullptr; DWORD pid = 0;
             if (LaunchGrowtopia(&hp, &pid)) {
                 CloseHandle(hp);
-                fresh.push_back(pid);
+                targets.push_back(pid);
             }
         }
-        if (fresh.empty()) {
+        if (targets.empty()) {
             Fail("could not launch any instance");
             system("pause");
             return 1;
         }
         // wait a bit for processes to stabilize
         Sleep(2000);
-    } else if (launchCount == -1) {
-        // default: if no Growtopia running at all, launch one
-        if (FindAllPidsByName(L"Growtopia.exe").empty()) {
-            Log("[*] No Growtopia running — launching one...");
-            HANDLE hp = nullptr; DWORD pid = 0;
-            if (!LaunchGrowtopia(&hp, &pid)) { system("pause"); return 1; }
-            CloseHandle(hp);
-            Sleep(2000);
-        }
+    } else {
+        // -n 0 → inject every running instance (legacy combine behavior)
+        targets = FindAllPidsByName(L"Growtopia.exe");
     }
-    // launchCount == 0 → inject only, never launch
 
-    // Collect every Growtopia PID
-    auto pids = FindAllPidsByName(L"Growtopia.exe");
-    if (pids.empty()) {
+    if (targets.empty()) {
         Log("[-] No Growtopia processes found");
         system("pause");
         return 1;
     }
-    Log("[*] Found %zu Growtopia instance(s)", pids.size());
+    Log("[*] Targeting %zu Growtopia instance(s)", targets.size());
 
     int success = 0, failed = 0, skipped = 0;
-    for (DWORD pid : pids) {
+    for (DWORD pid : targets) {
         if (IsAlreadyInjected(pid, dllName.c_str())) {
             printf("\n--- pid %lu ---\n", pid);
             Log("[+] already injected — skipping");
