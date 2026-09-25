@@ -186,18 +186,19 @@ void GameState::parseTextPacket(const std::string& text, bool incoming) {
     }
 
     if (action == "on_varlist") {
-        std::lock_guard<std::mutex> lock(mtx);
-        std::string msg = kv.count("msg") ? kv["msg"] : "";
-
-        debugLog("[VARLIST] msg=" + msg);
-
-        if (msg == "OnSetBux" || msg.find("SetBux") != std::string::npos) {
-            if (kv.count("1")) localPlayer.gems = safeInt(kv["1"]);
-        }
-
         PacketEvent ev;
         ev.type = "OnVarlist";
         ev.text = text;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            std::string msg = kv.count("msg") ? kv["msg"] : "";
+            debugLog("[VARLIST] msg=" + msg);
+            if (msg == "OnSetBux" || msg.find("SetBux") != std::string::npos) {
+                if (kv.count("1")) localPlayer.gems = safeInt(kv["1"]);
+            }
+        }
+        // pushEvent locks mtx itself — must be called OUTSIDE the lock
+        // (calling it while holding mtx = self-deadlock = game freeze)
         pushEvent(ev);
         return;
     }
@@ -383,7 +384,7 @@ BOOL WINAPI hk_wglSwapBuffers(HDC hdc) {
 
         g_executor = new LuaExecutor();
         g_Initialized = true;
-        consoleLog("[INFO] Coems Executor initialized inside Growtopia");
+        consoleLog("[INFO] EpsHax initialized inside Growtopia");
     }
 
     // Poll F1 via GetAsyncKeyState instead of global keyboard hook.
@@ -404,7 +405,7 @@ BOOL WINAPI hk_wglSwapBuffers(HDC hdc) {
     if (g_MenuOpen) {
         ImGui::SetNextWindowPos(ImVec2(50, 50), ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSize(ImVec2(700, 500), ImGuiCond_FirstUseEver);
-        ImGui::Begin("Coems Executor  |  F1 to toggle##executor", &g_MenuOpen,
+        ImGui::Begin("EpsHax  |  F1 to toggle##executor", &g_MenuOpen,
             ImGuiWindowFlags_NoCollapse);
 
         if (ImGui::BeginMenuBar()) {

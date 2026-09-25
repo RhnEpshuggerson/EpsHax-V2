@@ -31,7 +31,7 @@ struct CallbackInfo {
 
 struct TimerInfo {
     std::string name;
-    int interval_ms;
+    float interval;   // seconds (matches GrowPai timer.Create semantics)
     int repeat;
     int ref;
     float lastTick;

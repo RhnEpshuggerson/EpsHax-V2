@@ -432,7 +432,13 @@ static int g_TlsAppDataCount = 0;
 int WINAPI hk_recv(SOCKET s, char* buf, int len, int flags) {
     int result = o_recv(s, buf, len, flags);
 
-    if (result > 0 && buf) {
+    if (result > 4 && buf) {
+        // Parse plaintext game packets directly (skip TLS records)
+        bool isTls = (result >= 3 && (unsigned char)buf[0] == 0x17 &&
+                      (unsigned char)buf[1] == 0x03 && (unsigned char)buf[2] == 0x03);
+        if (!isTls) {
+            GameState::instance().parseIncoming(buf, result);
+        }
         static int heapScanCounter = 0;
         if (++heapScanCounter % 10 == 0) {
             ScanHeapForPackets();
@@ -663,8 +669,7 @@ void TryInstallSocketHooks() {
     if (hWS2) {
         InstallSocketHooks(hWS2);
         g_SocketHooksInstalled = true;
-        consoleLog("[INFO] All system DLL hooks DISABLED (Themida detects MinHook patches on bcrypt/ws2_32)");
-    consoleLog("[INFO] Using only wglSwapBuffers hook + heap scanner for data");
+        consoleLog("[INFO] Socket hooks installed (send/recv/WSA/connect)");
     }
 }
 
@@ -850,13 +855,34 @@ void MainThread(HMODULE hModule) {
         consoleLog("[INFO] wglSwapBuffers hook installed");
     }
 
-    // REMOVED: Themida/VMProtect detects MinHook patches on ws2_32/bcrypt and
-    // corrupts pointers causing ACCESS_VIOLATION at random addresses.
-    // Packet capture now relies on heap scanner only.
-    // TryInstallSocketHooks();
-    // TryInstallTLSHooks();
-    // TryInstallBCryptHooks();
-    consoleLog("[INFO] System DLL hooks DISABLED - using wglSwapBuffers + heap scanner only");
+    // System DLL hooks only when GrowPai is NOT loaded.
+    // If GrowPai is present, its bridge.json provides all game state —
+    // patching ws2_32/bcrypt first makes GrowPai's sigs::init fail and crash.
+    // GrowPai finishes sigs::init in ~1.5s; wait up to 15s re-checking so
+    // late-loaded GrowPai still wins the race.
+    auto isGrowPai = []() -> bool {
+        return GetModuleHandleA("Growpai.dll") != nullptr ||
+               GetModuleHandleA("GrowPai.dll") != nullptr;
+    };
+    if (isGrowPai()) {
+        consoleLog("[INFO] GrowPai detected — skipping system DLL hooks (bridge provides data)");
+    } else {
+        bool gotGrowPai = false;
+        for (int i = 0; i < 15; i++) {
+            Sleep(1000);
+            if (isGrowPai()) {
+                gotGrowPai = true;
+                consoleLog("[INFO] GrowPai loaded during delay — skipping system DLL hooks");
+                break;
+            }
+        }
+        if (!gotGrowPai) {
+            TryInstallSocketHooks();
+            TryInstallTLSHooks();
+            TryInstallBCryptHooks();
+            consoleLog("[INFO] System DLL hooks ENABLED (no GrowPai after 15s)");
+        }
+    }
 
     HMODULE hGame = GetModuleHandleA(NULL);
     if (hGame) {
@@ -879,6 +905,214 @@ void MainThread(HMODULE hModule) {
         return 0;
     }, nullptr, 0, nullptr);
     consoleLog("[INFO] Background heap scanner started (500ms interval)");
+
+    // Bridge reader thread — reads GrowPai's bridge.json for game state
+    CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+        const char* bridgePath = "C:\\temp\\growpai_bridge.json";
+        while (true) {
+                // Read and update, then sleep before next read
+                HANDLE hFile = CreateFileA(bridgePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+                if (hFile == INVALID_HANDLE_VALUE) { Sleep(2000); continue; }
+                DWORD fileSize = GetFileSize(hFile, nullptr);
+                if (fileSize == 0 || fileSize > 262144) { CloseHandle(hFile); Sleep(2000); continue; }
+            char* buf = (char*)malloc(fileSize + 1);
+            DWORD read = 0;
+            ReadFile(hFile, buf, fileSize, &read, nullptr);
+            CloseHandle(hFile);
+            buf[read] = '\0';
+            std::string json(buf, read);
+            free(buf);
+
+            auto& gs = GameState::instance();
+            std::lock_guard<std::mutex> lock(gs.mtx);
+
+            // Extract a JSON object's body given a top-level key
+            auto extractObject = [&](const std::string& key) -> std::string {
+                std::string needle = "\"" + key + "\":";
+                size_t pos = json.find(needle);
+                if (pos == std::string::npos) return "";
+                pos += needle.size();
+                while (pos < json.size() && json[pos] == ' ') pos++;
+                if (pos >= json.size() || json[pos] != '{') return "";
+                int depth = 0;
+                size_t start = pos;
+                for (; pos < json.size(); pos++) {
+                    if (json[pos] == '{') depth++;
+                    else if (json[pos] == '}') { depth--; if (depth == 0) return json.substr(start, pos - start + 1); }
+                }
+                return "";
+            };
+            auto extractArray = [&](const std::string& key) -> std::string {
+                std::string needle = "\"" + key + "\":";
+                size_t pos = json.find(needle);
+                if (pos == std::string::npos) return "";
+                pos += needle.size();
+                while (pos < json.size() && json[pos] == ' ') pos++;
+                if (pos >= json.size() || json[pos] != '[') return "";
+                int depth = 0;
+                size_t start = pos;
+                for (; pos < json.size(); pos++) {
+                    if (json[pos] == '[') depth++;
+                    else if (json[pos] == ']') { depth--; if (depth == 0) return json.substr(start, pos - start + 1); }
+                }
+                return "";
+            };
+
+            // Parse localPlayer object
+            std::string lpObj = extractObject("localPlayer");
+            auto findField = [&](const std::string& obj, const std::string& field) -> std::string {
+                std::string needle = "\"" + field + "\"";
+                size_t pos = obj.find(needle);
+                if (pos == std::string::npos) return "";
+                pos = obj.find(':', pos + needle.size());
+                if (pos == std::string::npos) return "";
+                pos++;
+                while (pos < obj.size() && obj[pos] == ' ') pos++;
+                if (pos >= obj.size()) return "";
+                if (obj[pos] == '"') {
+                    size_t end = obj.find('"', pos + 1);
+                    if (end == std::string::npos) return "";
+                    return obj.substr(pos + 1, end - pos - 1);
+                }
+                size_t end = pos;
+                while (end < obj.size() && obj[end] != ',' && obj[end] != '}' && obj[end] != ']') end++;
+                return obj.substr(pos, end - pos);
+            };
+
+            std::string name = findField(lpObj, "name");
+            std::string world = findField(lpObj, "world");
+            std::string gemsStr = findField(lpObj, "gems");
+            std::string country = findField(lpObj, "country");
+            std::string posX = findField(lpObj, "pos_x");
+            std::string posY = findField(lpObj, "pos_y");
+            std::string netidStr = findField(lpObj, "netid");
+            std::string useridStr = findField(lpObj, "userid");
+            std::string tileX = findField(lpObj, "tile_x");
+            std::string tileY = findField(lpObj, "tile_y");
+
+            if (!name.empty() && name != "null") {
+                gs.localPlayer.name = name;
+                if (!world.empty() && world != "null") gs.localPlayer.world = world;
+                if (!country.empty() && country != "null") gs.localPlayer.country = country;
+                if (!gemsStr.empty()) gs.localPlayer.gems = atoi(gemsStr.c_str());
+                if (!posX.empty()) gs.localPlayer.pos_x = (float)atof(posX.c_str());
+                if (!posY.empty()) gs.localPlayer.pos_y = (float)atof(posY.c_str());
+                if (!netidStr.empty()) gs.localPlayer.netid = atoi(netidStr.c_str());
+                if (!useridStr.empty()) gs.localPlayer.userid = atoi(useridStr.c_str());
+                if (!tileX.empty()) gs.localPlayer.tile_x = atoi(tileX.c_str());
+                if (!tileY.empty()) gs.localPlayer.tile_y = atoi(tileY.c_str());
+                consoleLog("[BRIDGE] localPlayer: name=" + gs.localPlayer.name +
+                    " gems=" + std::to_string(gs.localPlayer.gems) +
+                    " world=" + gs.localPlayer.world +
+                    " netid=" + std::to_string(gs.localPlayer.netid));
+            }
+
+            // Parse players array
+            std::string playersArr = extractArray("players");
+            if (!playersArr.empty()) {
+                gs.players.clear();
+                // Split objects in the array: find {...} groups
+                size_t i = 0;
+                while (i < playersArr.size()) {
+                    if (playersArr[i] == '{') {
+                        int depth = 0;
+                        size_t start = i;
+                        for (; i < playersArr.size(); i++) {
+                            if (playersArr[i] == '{') depth++;
+                            else if (playersArr[i] == '}') { depth--; if (depth == 0) break; }
+                        }
+                        if (i >= playersArr.size()) break;
+                        std::string pobj = playersArr.substr(start, i - start + 1);
+                        PlayerData pd;
+                        pd.name = findField(pobj, "name");
+                        pd.world = findField(pobj, "world");
+                        std::string pnetid = findField(pobj, "netid");
+                        std::string puserid = findField(pobj, "userid");
+                        std::string pgems = findField(pobj, "gems");
+                        std::string ppx = findField(pobj, "pos_x");
+                        std::string ppy = findField(pobj, "pos_y");
+                        std::string ptx = findField(pobj, "tile_x");
+                        std::string pty = findField(pobj, "tile_y");
+                        if (!pnetid.empty()) pd.netid = atoi(pnetid.c_str());
+                        if (!puserid.empty()) pd.userid = atoi(puserid.c_str());
+                        if (!pgems.empty()) pd.gems = atoi(pgems.c_str());
+                        if (!ppx.empty()) pd.pos_x = (float)atof(ppx.c_str());
+                        if (!ppy.empty()) pd.pos_y = (float)atof(ppy.c_str());
+                        if (!ptx.empty()) pd.tile_x = atoi(ptx.c_str());
+                        if (!pty.empty()) pd.tile_y = atoi(pty.c_str());
+                        if (!pd.name.empty())                     gs.players.push_back(pd);
+                        i++;
+                    } else i++;
+                }
+                consoleLog("[BRIDGE] players: " + std::to_string(gs.players.size()));
+            }
+            std::string invArr = extractArray("inventory");
+            if (!invArr.empty()) {
+                gs.inventory.clear();
+                size_t i = 0;
+                while (i < invArr.size()) {
+                    if (invArr[i] == '{') {
+                        int depth = 0;
+                        size_t start = i;
+                        for (; i < invArr.size(); i++) {
+                            if (invArr[i] == '{') depth++;
+                            else if (invArr[i] == '}') { depth--; if (depth == 0) break; }
+                        }
+                        if (i >= invArr.size()) break;
+                        std::string iobj = invArr.substr(start, i - start + 1);
+                        InventoryItem it;
+                        std::string iid = findField(iobj, "id");
+                        std::string icount = findField(iobj, "count");
+                        if (!iid.empty()) it.id = atoi(iid.c_str());
+                        if (!icount.empty()) it.count = atoi(icount.c_str());
+                        if (it.id > 0) gs.inventory.push_back(it);
+                        i++;
+                    } else i++;
+                }
+                consoleLog("[BRIDGE] inventory: " + std::to_string(gs.inventory.size()) + " items");
+            }
+
+            // Parse objects array
+            std::string objArr = extractArray("objects");
+            if (!objArr.empty()) {
+                gs.objects.clear();
+                size_t i = 0;
+                while (i < objArr.size()) {
+                    if (objArr[i] == '{') {
+                        int depth = 0;
+                        size_t start = i;
+                        for (; i < objArr.size(); i++) {
+                            if (objArr[i] == '{') depth++;
+                            else if (objArr[i] == '}') { depth--; if (depth == 0) break; }
+                        }
+                        if (i >= objArr.size()) break;
+                        std::string oobj = objArr.substr(start, i - start + 1);
+                        WorldObject wo;
+                        std::string oid = findField(oobj, "id");
+                        std::string ooid = findField(oobj, "oid");
+                        std::string opx = findField(oobj, "pos_x");
+                        std::string opy = findField(oobj, "pos_y");
+                        std::string ocount = findField(oobj, "count");
+                        if (!oid.empty()) wo.id = atoi(oid.c_str());
+                        if (!ooid.empty()) wo.oid = atoi(ooid.c_str());
+                        if (!opx.empty()) wo.pos_x = (float)atof(opx.c_str());
+                        if (!opy.empty()) wo.pos_y = (float)atof(opy.c_str());
+                        if (!ocount.empty()) wo.count = atoi(ocount.c_str());
+                        gs.objects.push_back(wo);
+                        i++;
+                    } else i++;
+                }
+                consoleLog("[BRIDGE] objects: " + std::to_string(gs.objects.size()));
+            }
+
+            // Ping
+            std::string pingStr = findField(json, "ping");
+            if (!pingStr.empty()) gs.ping_ms = atoi(pingStr.c_str());
+            Sleep(3000);
+        }
+        return 0;
+    }, nullptr, 0, nullptr);
+    consoleLog("[INFO] Bridge reader started (reads GrowPai bridge.json)");
 
     auto t0 = std::chrono::steady_clock::now();
 

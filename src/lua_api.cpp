@@ -54,8 +54,8 @@ bool LuaExecutor::execute(const std::string& script) {
     lastTickTime = g_currentTime;
     int err = luaL_loadstring(L, script.c_str()) || lua_pcall(L, 0, 0, 0);
     if (err) {
-        std::string e = lua_tostring(L, -1);
-        consoleLog("[ERROR] " + e);
+        const char* errmsg = lua_tostring(L, -1);
+        consoleLog("[ERROR] " + std::string(errmsg ? errmsg : "(non-string error object)"));
         lua_pop(L, 1);
         running = false;
         return false;
@@ -76,7 +76,7 @@ void LuaExecutor::tick(float dt) {
             int status = lua_resume(it->co, L, 0, &nres);
             if (status == LUA_OK) { luaL_unref(L, LUA_REGISTRYINDEX, it->ref); it = threads.erase(it); }
             else if (status == LUA_YIELD) { ++it; }
-            else { consoleLog("[ERROR] Thread: " + std::string(lua_tostring(it->co, -1))); lua_pop(it->co, 1); luaL_unref(L, LUA_REGISTRYINDEX, it->ref); it = threads.erase(it); }
+            else { const char* errmsg = lua_tostring(it->co, -1); consoleLog("[ERROR] Thread: " + std::string(errmsg ? errmsg : "(non-string error object)")); lua_pop(it->co, 1); luaL_unref(L, LUA_REGISTRYINDEX, it->ref); it = threads.erase(it); }
         } else { ++it; }
     }
 
@@ -128,7 +128,7 @@ void LuaExecutor::tick(float dt) {
 
     // Tick timers
     for (auto it = timers.begin(); it != timers.end(); ) {
-        if (now - it->lastTick >= it->interval_ms / 1000.0f) {
+        if (now - it->lastTick >= it->interval) {
             it->lastTick = now;
             lua_rawgeti(L, LUA_REGISTRYINDEX, it->ref);
             if (lua_pcall(L, 0, 0, 0) != 0) { lua_pop(L, 1); }
@@ -381,7 +381,8 @@ int LuaExecutor::lua_RunThread(lua_State* L) {
         if (self) { for (auto it = self->threads.begin(); it != self->threads.end(); ++it) if (it->co == co) { self->threads.erase(it); break; } }
         luaL_unref(L, LUA_REGISTRYINDEX, ref);
     } else if (status != LUA_YIELD) {
-        consoleLog("[ERROR] Thread: " + std::string(lua_tostring(co, -1)));
+        const char* errmsg = lua_tostring(co, -1);
+        consoleLog("[ERROR] Thread: " + std::string(errmsg ? errmsg : "(non-string error object)"));
         lua_pop(co, 1);
         if (self) { for (auto it = self->threads.begin(); it != self->threads.end(); ++it) if (it->co == co) { self->threads.erase(it); break; } }
         luaL_unref(L, LUA_REGISTRYINDEX, ref);
@@ -445,7 +446,7 @@ int LuaExecutor::lua_GetItemInfo(lua_State* L) {
 
 int LuaExecutor::lua_MessageBox(lua_State* L) {
     const char* text = luaL_checkstring(L, 1);
-    const char* caption = lua_isstring(L, 2) ? lua_tostring(L, 2) : "Coems Executor";
+    const char* caption = lua_isstring(L, 2) ? lua_tostring(L, 2) : "EpsHax";
     MessageBoxA(nullptr, text, caption, MB_OK | MB_TOPMOST);
     return 0;
 }
@@ -544,7 +545,7 @@ int LuaExecutor::lua_SendWebhook(lua_State* L) {
         }
         std::wstring host(urlComp.lpszHostName, urlComp.dwHostNameLength);
         std::wstring path(urlComp.lpszUrlPath, urlComp.dwUrlPathLength);
-        HINTERNET hSession = WinHttpOpen(L"CoemsExecutor/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        HINTERNET hSession = WinHttpOpen(L"EpsHax/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
         if (!hSession) { delete[] urlComp.lpszHostName; delete[] urlComp.lpszUrlPath; delete[] urlComp.lpszExtraInfo; return; }
         HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), urlComp.nPort, 0);
         if (!hConnect) { WinHttpCloseHandle(hSession); delete[] urlComp.lpszHostName; delete[] urlComp.lpszUrlPath; delete[] urlComp.lpszExtraInfo; return; }
@@ -565,7 +566,7 @@ int LuaExecutor::lua_SendWebhook(lua_State* L) {
 
 int LuaExecutor::lua_timer_Create(lua_State* L) {
     const char* name = luaL_checkstring(L, 1);
-    int interval = (int)luaL_checkinteger(L, 2);
+    float interval = (float)luaL_checknumber(L, 2);  // seconds (GrowPai semantics)
     int repeat_count = (int)luaL_checkinteger(L, 3);
     luaL_checktype(L, 4, LUA_TFUNCTION);
     LuaExecutor* self = nullptr;

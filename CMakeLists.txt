@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(coems_executor LANGUAGES CXX C)
+project(EpsHax LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -87,7 +87,7 @@ target_include_directories(imgui PUBLIC
 )
 
 # ── DLL ───────────────────────────────────────────────────────────────
-add_library(coems_executor SHARED
+add_library(EpsHax SHARED
     src/dllmain.cpp
     src/lua_api.cpp
     src/hook.cpp
@@ -95,6 +95,11 @@ add_library(coems_executor SHARED
     src/native_hook.cpp
     src/lua_state_finder.cpp
 )
-target_include_directories(coems_executor PRIVATE src)
-target_link_libraries(coems_executor PRIVATE imgui lua minhook opengl32 ws2_32 winhttp)
-target_compile_definitions(coems_executor PRIVATE COEMS_EXPORTS)
+target_include_directories(EpsHax PRIVATE src)
+target_link_libraries(EpsHax PRIVATE imgui lua minhook opengl32 ws2_32 winhttp)
+target_compile_definitions(EpsHax PRIVATE EPSHAX_EXPORTS)
+
+# ── Loader (injects EpsHax.dll into Growtopia) ────────────────────────
+add_executable(EpsHaxLoader src/loader.cpp)
+target_link_libraries(EpsHaxLoader PRIVATE user32 advapi32 shell32 psapi)
+target_link_options(EpsHaxLoader PRIVATE "/MANIFESTUAC:level='requireAdministrator'")
