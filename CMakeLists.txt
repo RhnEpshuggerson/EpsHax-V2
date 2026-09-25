@@ -85,10 +85,15 @@ add_library(EpsHax SHARED
     src/native_hook.cpp
     src/lua_state_finder.cpp
     src/epshook.cpp
+    src/discord_rpc.cpp
 )
 target_include_directories(EpsHax PRIVATE src)
 target_link_libraries(EpsHax PRIVATE imgui lua opengl32 ws2_32 winhttp)
 target_compile_definitions(EpsHax PRIVATE EPSHAX_EXPORTS)
+
+# ── Discord rich presence smoke test ───────────────────────────────────
+add_executable(DiscordRpcTest test/rpc_test.cpp src/discord_rpc.cpp)
+target_include_directories(DiscordRpcTest PRIVATE src)
 
 # ── Loader (injects EpsHax.dll into Growtopia) ────────────────────────
 add_executable(EpsHaxLoader src/loader.cpp)

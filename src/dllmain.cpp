@@ -5,6 +5,7 @@
 #include "hook.h"
 #include "scanner.h"
 #include "native_hook.h"
+#include "discord_rpc.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -851,6 +852,10 @@ void MainThread(HMODULE hModule) {
             consoleLog(buf);
         }
     }
+
+    discordrpc::Start([](const char* m) {
+        consoleLog(std::string("[RPC] ") + m);
+    });
 
     // System DLL hooks only when GrowPai is NOT loaded.
     // If GrowPai is present, its bridge.json provides all game state —
