@@ -112,12 +112,15 @@ add_executable(DiscordRpcTest test/rpc_test.cpp src/discord_rpc.cpp)
 target_include_directories(DiscordRpcTest PRIVATE src)
 
 # ── Loader (injects EpsHax.dll into Growtopia) ────────────────────────
-add_executable(EpsHaxLoader src/loader.cpp)
+# Shared icon resource: both loader and launcher embed EpsHaxIcon.ico so the
+# UAC prompt, Explorer, taskbar and title bar all show the EpsHax face.
+configure_file(src/launcher.rc.in ${CMAKE_CURRENT_BINARY_DIR}/launcher.rc @ONLY)
+
+add_executable(EpsHaxLoader src/loader.cpp ${CMAKE_CURRENT_BINARY_DIR}/launcher.rc)
 target_link_libraries(EpsHaxLoader PRIVATE user32 advapi32 shell32 psapi)
 target_link_options(EpsHaxLoader PRIVATE "/MANIFESTUAC:level='requireAdministrator'")
 
 # ── EpsHaxLauncher: GUI (Play / Scripts / Logs) for Growtopia & Creative ──
-configure_file(src/launcher.rc.in ${CMAKE_CURRENT_BINARY_DIR}/launcher.rc @ONLY)
 add_executable(EpsHaxLauncher WIN32 src/launcher.cpp ${CMAKE_CURRENT_BINARY_DIR}/launcher.rc)
 target_compile_options(EpsHaxLauncher PRIVATE /utf-8)
 target_link_libraries(EpsHaxLauncher PRIVATE user32 advapi32 shell32 comctl32)
